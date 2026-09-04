@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Particle scene — minimal</title>
+<style>
+  html, body { margin:0; height:100%; background:#05070d; overflow:hidden }
+  canvas { display:block; width:100%; height:100%; pointer-events:none }
+  .caption { position:fixed; left:0; right:0; top:50%; transform:translateY(-50%); display:flex; justify-content:space-between;
+    padding:0 6vw; pointer-events:none; font:600 clamp(28px,7vw,84px)/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color:#f2f5fa; letter-spacing:-.03em; mix-blend-mode:screen }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<div class="caption"><span>Title</span><span>Here</span></div>
+
+<script>
+'use strict';
+/* -----------------------------------------------------------------------------
+   PARTICLE SCENE — MINIMAL (WebGL2, zero dependencies, ~150 lines)
+   One draw call of GL_POINTS. All motion happens in the vertex shader as a pure
+   function of time; the CPU only sends the clock. No post-processing.
+   Same SUBJECT contract as template-full.html, so a subject written here drops
+   straight into the full pipeline when you want bloom, lens and grain.
+   ----------------------------------------------------------------------------- */
+
+/* 1 ─ CONFIG + SUBJECT (the parts you change) ---------------------------------- */
+const N = 7000;
+const PALETTE = { cool: [0.72, 0.84, 1.00], warm: [1.00, 0.63, 0.38] };
+const SUBJECT_UNIFORMS = { uSpin: 0.22 };
+
+const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) * 0.9;
+function generateSubject(N) {
+  const seed = new Float32Array(N * 4), dna = new Float32Array(N * 4), scatter = new Float32Array(N * 4);
+  const ARMS = 3, TWIST = 5.0;
+  for (let i = 0; i < N; i++) {
+    const bulge = i % 10 === 0;
+    const r = bulge ? Math.pow(Math.random(), 2) * 0.18 : Math.pow(Math.random(), 0.55);
+    const arm = (i % ARMS) * (Math.PI * 2 / ARMS);
+    const spread = bulge ? 3.0 : 0.10 + (1 - r) * 0.22;
+    seed[i * 4] = r; seed[i * 4 + 1] = arm + r * TWIST + gauss() * spread;
+    dna[i * 4] = 1.0 + Math.pow(Math.random(), 3.4) * 6;      // size: few big, many tiny
+    dna[i * 4 + 1] = 0.25 + Math.random() * 0.75;             // brightness
+    dna[i * 4 + 2] = Math.random() < 0.3 ? Math.random() : 0; // colour mix
+    dna[i * 4 + 3] = Math.random() * 6.2832;                  // twinkle phase
+    scatter[i * 4 + 2] = Math.random();
+  }
+  return { seed, dna, scatter };
+}
+
+const SUBJECT_GLSL = /* glsl */`
+uniform float uSpin;
+void subject(float t, vec4 seed, vec4 dna, vec4 scatter, inout Particle o) {
+  float r = seed.x;
+  float ang = seed.y + t * uSpin / (0.28 + r * 1.6);      // differential rotation
+  o.pos = vec2(cos(ang), sin(ang)) * r * 0.78;
+  o.emphasis = smoothstep(1.05, 0.55, r);                 // fade at the rim
+}`;
+
+/* 2 ─ SHADERS ------------------------------------------------------------------- */
+const VERT = `#version 300 es
+precision highp float;
+in vec4 aSeed; in vec4 aDna; in vec4 aScatter;
+uniform float uTime, uAspect, uPixelRatio;
+uniform vec3 uCool, uWarm;
+out vec3 vColor; out float vAlpha; out float vCross;
+struct Particle { vec2 pos; float depth; float emphasis; float reveal; vec3 color; float size; float cross; };
+${SUBJECT_GLSL}
+void main() {
+  Particle o = Particle(vec2(0.0), 0.0, 1.0, aScatter.z, mix(uCool, uWarm, aDna.z), 1.0, 1.0);
+  subject(uTime, aSeed, aDna, aScatter, o);
+  vec2 pos = o.pos * (1.0 + 0.02 * sin(uTime * 0.5));     // 2% breathing
+  gl_Position = vec4(pos.x / uAspect, pos.y, 0.0, 1.0);   // aspect correction so circles stay circles
+  float twinkle = 0.72 + 0.28 * sin(uTime * 2.2 + aDna.w * 6.2832);
+  gl_PointSize = aDna.x * uPixelRatio * twinkle * o.size * mix(1.0, 0.6, o.depth);   // device pixels!
+  vColor = o.color;
+  vAlpha = aDna.y * twinkle * o.emphasis;
+  vCross = o.cross;
+}`;
+
+const FRAG = `#version 300 es
+precision highp float;
+in vec3 vColor; in float vAlpha; in float vCross;
+out vec4 fragColor;
+void main() {
+  vec2 d = gl_PointCoord - 0.5; float dist = length(d);
+  if (dist > 0.5) discard;                                    // square point -> disc
+  float core = pow(smoothstep(0.5, 0.0, dist), 3.0);         // soft ball
+  float halo = smoothstep(0.5, 0.0, dist) * 0.25;
+  float cross = (max(0.0, 1.0 - abs(d.x) * 26.0) + max(0.0, 1.0 - abs(d.y) * 26.0)) * smoothstep(0.5, 0.05, dist) * 0.3 * vCross;
+  float a = (core + halo + cross) * vAlpha;
+  fragColor = vec4(vColor * a, a);                            // premultiplied colour
+}`;
+
+/* 3 ─ CONTEXT + PROGRAM ---------------------------------------------------------- */
+const canvas = document.getElementById('scene');
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, powerPreference: 'high-performance' });
+if (!gl) { document.body.style.background = 'radial-gradient(60% 50% at 50% 50%, #1a2440, #05070d)'; throw new Error('WebGL2 unavailable'); }
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT)); gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+/* 4 ─ BUFFERS (uploaded once, STATIC_DRAW, never touched again) ------------------ */
+const data = generateSubject(N);
+gl.bindVertexArray(gl.createVertexArray());
+for (const [name, arr] of [['aSeed', data.seed], ['aDna', data.dna], ['aScatter', data.scatter]]) {
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, name); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, 0, 0);
+}
+const u = name => gl.getUniformLocation(prog, name);            // resolved once, never inside the loop
+const U = { time: u('uTime'), aspect: u('uAspect'), dpr: u('uPixelRatio') };
+gl.uniform3fv(u('uCool'), PALETTE.cool); gl.uniform3fv(u('uWarm'), PALETTE.warm);
+for (const k in SUBJECT_UNIFORMS) gl.uniform1f(u(k), SUBJECT_UNIFORMS[k]);
+
+/* 5 ─ RENDER STATE: additive blending, light adds up ----------------------------- */
+gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+gl.clearColor(0.02, 0.027, 0.05, 1);
+
+/* 6 ─ RESIZE with DPR clamp ------------------------------------------------------ */
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(canvas.clientWidth * dpr); canvas.height = Math.floor(canvas.clientHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.uniform1f(U.aspect, canvas.width / canvas.height); gl.uniform1f(U.dpr, dpr);
+}
+addEventListener('resize', resize); resize();
+
+/* 7 ─ LOOP: reduced motion freezes the clock, hidden tabs cost nothing ---------- */
+const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+let t = 0, last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (document.hidden) { last = now; return; }
+  const dt = Math.min((now - last) / 1000, 1 / 30);            // clamp: no jump after a hidden tab
+  last = now;
+  if (!reduced.matches) t += dt;
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform1f(U.time, t);
+  gl.drawArrays(gl.POINTS, 0, N);                              // the only draw call
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

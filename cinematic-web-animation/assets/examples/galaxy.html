@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Galaxy</title>
+<style>
+  :root { --bg:#04060b; --ink:#eef2f8; --muted:rgba(238,242,248,.55); --line:rgba(238,242,248,.14); }
+  * { box-sizing:border-box }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { overflow:hidden }   /* remove this line for a page that scrolls; see references/interaction.md */
+
+  /* The scene is decoration: fixed, behind everything, never receives input, never steals focus. */
+  #scene { position:fixed; inset:0; width:100%; height:100%; display:block; z-index:0; pointer-events:none }
+
+  /* Fallback when WebGL2 is unavailable or the context is lost: a static gradient, never a black box. */
+  body.no-webgl #scene { display:none }
+  body.no-webgl::before { content:""; position:fixed; inset:0; z-index:0;
+    background:radial-gradient(60% 50% at 50% 50%, #1a2440 0%, #0a0f1d 45%, var(--bg) 100%); }
+
+  /* Foreground content sits above the canvas. The vignette in the composite pass keeps text readable. */
+  .content { position:relative; z-index:1; min-height:100%; display:flex; align-items:center;
+    justify-content:space-between; padding:0 6vw; pointer-events:none }
+  .content h1 { margin:0; font-weight:600; font-size:clamp(30px,7.5vw,96px); letter-spacing:-.035em;
+    mix-blend-mode:screen; opacity:0; transform:translateY(.35em); filter:blur(6px);
+    animation:rise 1.4s cubic-bezier(.16,1,.3,1) forwards }
+  .content h1:nth-child(2) { animation-delay:.18s }
+  @keyframes rise { to { opacity:1; transform:none; filter:blur(0) } }
+  @media (prefers-reduced-motion: reduce) { .content h1 { animation:none; opacity:1; transform:none; filter:none } }
+
+  .hint { position:fixed; left:0; right:0; bottom:18px; z-index:1; text-align:center; color:var(--muted);
+    font-size:12px; letter-spacing:.02em; pointer-events:none }
+
+  /* Debug HUD, toggled with the "h" key. Delete for production. */
+  #hud { position:fixed; top:12px; right:12px; z-index:2; font:12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    color:var(--muted); background:rgba(10,14,22,.72); border:1px solid var(--line); border-radius:10px;
+    padding:8px 11px; backdrop-filter:blur(10px); white-space:pre }
+  #hud[hidden] { display:none }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<main class="content"><h1>Deep</h1><h1>Field</h1></main>
+<div class="hint">move (lens) · click (pulse) · scroll (drift) · h (stats) · r (reduced motion) · i (replay intro)</div>
+<div id="hud" hidden></div>
+
+<script>
+'use strict';
+/* =============================================================================
+   CINEMATIC PARTICLE SCENE — full pipeline, WebGL2, zero dependencies
+
+   Pipeline per frame:
+     [0] optional fullscreen "field" pass (sky, nebula clouds, aurora…)  -> HDR scene buffer
+     [1] particles as GL_POINTS, additive blending                       -> same HDR buffer
+     [2] luminance cut with soft knee                                     -> 1/2 res
+     [3] 4 downsample levels (9-tap tent)                                 -> pyramid
+     [4] additive upsample back through the pyramid                       -> wide soft bloom
+     [5] composite: scene + bloom, exposure, ACES, vignette, grain, dither -> screen
+
+   The central idea: every particle's motion is a pure function of time computed in the
+   VERTEX SHADER from immutable per-particle attributes ("DNA"). The CPU uploads nothing
+   per frame except a few uniforms, so 80k particles cost about the same as 8k.
+
+   Three sections:  1. CONFIG   2. SUBJECT (what is drawn)   3. ENGINE (how it is drawn)
+   To draw something else, edit 1 and 2. The engine rarely needs changes.
+   ============================================================================= */
+
+/* ===== SUBJECT BLOCK START ===== */
+// @template full
+/* GALAXY — the reference subject (a from-scratch recreation of the openai.com GPT-6 Astra hero technique).
+   VARIANT: 'spiral' (default) | 'barred' | 'elliptical' | 'globular'
+   Knobs: ARMS, TWIST (how tightly the arms wind), SPREAD (arm thickness), CONFIG.subject.uSpin / uCore / uEdgeFade.
+   Tuning lessons that cost time:
+     • sqrt(random) for the radius → uniform density per AREA. Plain random() piles everything into the centre.
+     • Keep the bulge under ~5% of the particles. Under additive blending, more turns the core into a white disc.
+     • Fade brightness only at the outer rim. An aggressive falloff erases exactly the arms you want to show.
+     • To see the raw structure while tuning, set post.bloom = 0 and subject.uCore = 0 and raise exposure. */
+
+/* ── 1. CONFIG ─────────────────────────────────────────────────────────────── */
+const VARIANT = 'spiral';
+const ARMS = 3, TWIST = 5.0, SPREAD = 0.12;
+
+const CONFIG = {
+  count: 24000,
+  backgroundRatio: 0.09,
+  maxPointSize: 96,
+  sizeScale: 1.0,
+  twinkleSpeed: 2.2,
+  breath: 0.02,
+  intro: { duration: 3.2, propagation: 1.4 },
+  lens:  { enabled: true, radius: 0.34, magnification: 1.5, illumination: 0.6 },
+  scroll:{ drift: 0.22, scatter: 0.08, shrink: 0.25 },
+  post:  { bloom: 0.45, threshold: 0.9, exposure: 3.0, grain: 0.03, vignette: 0.25 },
+  palette: { cool: [0.70, 0.83, 1.00], warm: [1.00, 0.60, 0.34] },
+  clearColor: [0.008, 0.011, 0.02],
+  subject: { uSpin: VARIANT === 'elliptical' || VARIANT === 'globular' ? 0.06 : 0.22, uCore: 0.15, uEdgeFade: 1.0 },
+};
+
+/* ── 2. SUBJECT ─────────────────────────────────────────────────────────────── */
+const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) * 0.9;
+
+function generateSubject(N) {
+  const seed = new Float32Array(N * 4), dna = new Float32Array(N * 4), scatter = new Float32Array(N * 4);
+  for (let i = 0; i < N; i++) {
+    let r, ang, axis = 1.0;
+    if (VARIANT === 'elliptical') {
+      r = Math.pow(Math.random(), 0.9); ang = Math.random() * 6.2832; axis = 0.62;
+    } else if (VARIANT === 'globular') {
+      r = Math.pow(Math.random(), 1.6) * 0.75; ang = Math.random() * 6.2832;
+    } else {
+      const bulge = i % 26 === 0;                                    // ~4% in the bulge
+      r = bulge ? Math.pow(Math.random(), 2) * 0.12 : Math.sqrt(Math.random());
+      const arm = (i % ARMS) * (Math.PI * 2 / ARMS);
+      const spread = bulge ? 3.2 : SPREAD * (0.45 + (1 - r));         // arms thin out toward the tip
+      if (VARIANT === 'barred' && !bulge && r < 0.32) {
+        ang = (i % 2) * Math.PI + gauss() * 0.10;                      // the bar: two opposite directions, tight spread
+      } else {
+        const r0 = VARIANT === 'barred' ? Math.max(0, r - 0.32) : r;
+        ang = arm + r0 * TWIST + gauss() * spread;                     // logarithmic spiral
+        if (VARIANT === 'barred') ang += (i % 2) * Math.PI - (i % ARMS) * (Math.PI * 2 / ARMS);   // arms leave from the bar ends
+      }
+    }
+    seed[i * 4] = r; seed[i * 4 + 1] = ang; seed[i * 4 + 2] = axis; seed[i * 4 + 3] = 0;
+    dna[i * 4]     = 0.9 + Math.pow(Math.random(), 3.6) * 7;           // few big stars, many tiny ones
+    dna[i * 4 + 1] = 0.45 + Math.random() * 0.85;
+    dna[i * 4 + 2] = Math.random() < 0.32 ? Math.pow(Math.random(), 0.7) : 0;   // mostly cool, some warm
+    dna[i * 4 + 3] = Math.random() * 6.2832;
+    const a = Math.random() * 6.2832, d = (0.25 + Math.random() * 1.1) * 1.7;   // intro starts as a wide dispersed cloud
+    scatter[i * 4] = Math.cos(a) * d; scatter[i * 4 + 1] = Math.sin(a) * d;
+    scatter[i * 4 + 2] = Math.random(); scatter[i * 4 + 3] = 0;
+  }
+  return { seed, dna, scatter };
+}
+
+const SUBJECT_GLSL = /* glsl */`
+uniform float uSpin, uCore, uEdgeFade;
+void subject(float t, vec4 seed, vec4 dna, vec4 scatter, inout Particle o) {
+  float r   = seed.x;
+  float ang = seed.y + t * uSpin / (0.28 + r * 1.6);    // differential rotation: the core spins faster than the rim
+  o.pos   = vec2(cos(ang), sin(ang) * seed.z) * r * 1.02;
+  o.depth = r * 0.18;
+  float core = 1.0 + uCore * exp(-r * 9.0);              // brighter core, not more stars
+  o.emphasis = pow(core, 0.75) * mix(1.0, 0.55, smoothstep(0.70, 1.20, r * uEdgeFade));
+  o.reveal = r;                                          // the intro lights up from the centre outward
+}`;
+
+const FIELD_GLSL = null;
+/* ===== SUBJECT BLOCK END ===== */
+
+/* ── 3. ENGINE ─────────────────────────────────────────────────────────────
+   createScene(canvas, { config, generateSubject, subjectGlsl, fieldGlsl })
+     -> { config, stats, replayIntro(), rebuild(), setReducedMotion(bool|null), step(dt), destroy() }  or null if WebGL2 is missing
+   For React/Vue, copy this function into its own module and call it from an effect (references/integration.md). */
+function createScene(canvas, opts) {
+  const config = opts.config;
+  const gl = canvas.getContext('webgl2', {
+    alpha: false, antialias: false, depth: false, stencil: false,      // points have no geometric edges and no occlusion: MSAA and z-buffer are pure waste
+    premultipliedAlpha: true, powerPreference: 'high-performance'
+  });
+  if (!gl) return null;
+  const hasFloat = !!gl.getExtension('EXT_color_buffer_float');       // HDR targets: values > 1.0 survive so the bloom has something to harvest
+  const pointRange = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+
+  /* shaders ---------------------------------------------------------------- */
+  const VS_SCREEN = `#version 300 es
+  out vec2 vUv;
+  void main(){ vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); vUv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+
+  const VS_POINTS = `#version 300 es
+  precision highp float;
+  in vec4 aSeed; in vec4 aDna; in vec4 aScatter;
+  uniform float uTime, uAspect, uPixelRatio, uReduced;
+  uniform float uTwinkle, uSizeScale, uBreath, uMaxPointSize;
+  uniform float uIntro, uPropagation, uExhale;
+  uniform float uScrollDrift, uScrollScatter, uScrollSize;
+  uniform vec2  uLensPointer; uniform float uLensActive, uLensRadius, uLensMag, uLensIllum;
+  uniform vec3  uCool, uWarm;
+  out vec3 vColor; out float vAlpha; out float vCross;
+  struct Particle { vec2 pos; float depth; float emphasis; float reveal; vec3 color; float size; float cross; };
+  ${opts.subjectGlsl}
+  void main() {
+    Particle o = Particle(vec2(0.0), 0.0, 1.0, aScatter.z, mix(uCool, uWarm, aDna.z), 1.0, clamp(aDna.x * aDna.y * 0.09, 0.0, 1.0));
+    subject(uTime, aSeed, aDna, aScatter, o);
+    vec2 pos = o.pos; float depth = o.depth, emphasis = o.emphasis;
+    float bg = aScatter.w;
+
+    // Propagated intro: each particle's progress is the global progress shifted by its reveal order.
+    float p = clamp(uIntro * (1.0 + uPropagation) - o.reveal * uPropagation, 0.0, 1.0);
+    p = p * p * (3.0 - 2.0 * p);
+    pos = mix(aScatter.xy, pos, p);                             // intro start position -> final shape
+
+    pos *= 1.0 + uBreath * sin(uTime * 0.5);                    // ambient breathing
+    pos *= 1.0 + uExhale * (0.3 + aScatter.z * 0.5);            // click pulse
+    pos.y += uScrollDrift * (0.5 + aScatter.z);                 // scroll drift…
+    pos += aScatter.xy * uScrollScatter;                        // …and scatter
+
+    if (bg > 0.5) {                                             // background layer: slow parallax, no subject motion
+      pos = aScatter.xy * 1.9; pos.y += uScrollDrift * 0.12; pos *= 1.0 + 0.004 * sin(uTime * 0.3);
+      depth = 1.0; emphasis = 1.0; p = max(p, uIntro);
+    }
+    vec2 screen = vec2(pos.x / uAspect, pos.y);
+
+    // Pointer lens: pushes particles radially away from the pointer (magnification) and lights them.
+    float lensGlow = 0.0;
+    if (uLensActive > 0.5) {
+      vec2 d = screen - uLensPointer; float dist = length(d);
+      float f = smoothstep(uLensRadius, 0.0, dist);
+      screen += normalize(d + 1e-5) * f * uLensRadius * (uLensMag - 1.0) * 0.45;
+      lensGlow = f;
+    }
+    gl_Position = vec4(screen, 0.0, 1.0);
+
+    float twinkle = 0.7 + 0.3 * sin(uTime * uTwinkle + aDna.w * 6.2831);
+    float size = aDna.x * uPixelRatio * uSizeScale * uScrollSize * twinkle * o.size * mix(1.0, 0.6, depth) * mix(0.15, 1.0, p);
+    if (bg > 0.5) size *= 0.4;
+    size *= 1.0 + lensGlow * (uLensMag - 1.0) * 1.4;
+    gl_PointSize = clamp(size, 0.0, uMaxPointSize);             // gl_PointSize is in DEVICE pixels, hence uPixelRatio
+
+    vColor = bg > 0.5 ? mix(uCool, uWarm, aDna.z) : o.color;
+    float a = aDna.y * twinkle * emphasis * p;
+    a *= mix(1.0, 0.16, bg);
+    a *= 1.0 + lensGlow * uLensIllum;
+    vAlpha = a;
+    vCross = o.cross;                                           // by default only big bright particles get a diffraction cross
+  }`;
+
+  // SPRITE: procedural, no texture. gl_PointCoord runs 0..1 inside the point. Alternatives in references/shader-cookbook.md.
+  const FS_POINTS = `#version 300 es
+  precision highp float;
+  in vec3 vColor; in float vAlpha; in float vCross;
+  out vec4 fragColor;
+  void main() {
+    vec2 d = gl_PointCoord - 0.5; float dist = length(d);
+    if (dist > 0.5) discard;
+    float core  = pow(smoothstep(0.5, 0.0, dist), 3.5);
+    float halo  = smoothstep(0.5, 0.0, dist) * 0.22;
+    float cross = (max(0.0, 1.0 - abs(d.x) * 30.0) + max(0.0, 1.0 - abs(d.y) * 30.0)) * smoothstep(0.5, 0.04, dist) * vCross;
+    float a = (core + halo + cross) * vAlpha;
+    fragColor = vec4(vColor * a, a);                            // premultiplied -> pure additive blend
+  }`;
+
+  const FS_FIELD = opts.fieldGlsl && `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 fragColor;
+  uniform float uTime, uAspect, uReduced; uniform vec2 uPointer, uRes;
+  // noise helpers shared with template-field.html, so a field() works in both
+  float hash21(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+  float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x), mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y); }
+  float fbm(vec2 p){ float v = 0.0, a = 0.5; mat2 R = mat2(0.8, 0.6, -0.6, 0.8);
+    for (int i = 0; i < 5; i++) { v += a * vnoise(p); p = R * p * 2.02 + 17.3; a *= 0.5; } return v; }
+  ${opts.fieldGlsl}
+  void main(){ vec2 p = vUv * 2.0 - 1.0; p.x *= uAspect; fragColor = vec4(field(vUv, p, uTime), 1.0); }`;
+
+  const FS_BRIGHT = `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 fragColor;
+  uniform sampler2D uSrc; uniform float uThreshold;
+  void main(){
+    vec3 c = texture(uSrc, vUv).rgb;
+    float lum  = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float knee = uThreshold * 0.6 + 1e-4;                        // soft knee: no flicker at the threshold edge
+    float soft = clamp(lum - uThreshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    float w = max(soft, lum - uThreshold) / max(lum, 1e-4);
+    fragColor = vec4(c * w, 1.0);
+  }`;
+
+  const FS_TENT = `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 fragColor;
+  uniform sampler2D uSrc; uniform vec2 uTexel; uniform float uRadius;
+  void main(){
+    vec2 o = uTexel * uRadius;
+    vec3 s = texture(uSrc, vUv + vec2(-o.x,  o.y)).rgb + texture(uSrc, vUv + vec2(0.0,  o.y)).rgb * 2.0 + texture(uSrc, vUv + vec2(o.x,  o.y)).rgb
+           + texture(uSrc, vUv + vec2(-o.x,  0.0)).rgb * 2.0 + texture(uSrc, vUv).rgb * 4.0 + texture(uSrc, vUv + vec2(o.x,  0.0)).rgb * 2.0
+           + texture(uSrc, vUv + vec2(-o.x, -o.y)).rgb + texture(uSrc, vUv + vec2(0.0, -o.y)).rgb * 2.0 + texture(uSrc, vUv + vec2(o.x, -o.y)).rgb;
+    fragColor = vec4(s / 16.0, 1.0);
+  }`;
+
+  const FS_COMPOSITE = `#version 300 es
+  precision highp float;
+  in vec2 vUv; out vec4 fragColor;
+  uniform sampler2D uScene, uBloom;
+  uniform float uBloomIntensity, uExposure, uGrain, uVignette, uTime;
+  uniform vec2 uRes;
+  float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+  void main(){
+    vec3 c = texture(uScene, vUv).rgb + texture(uBloom, vUv).rgb * uBloomIntensity;
+    c *= uExposure;                                              // tune exposure AFTER enabling tone mapping: ACES crushes the lows
+    c = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);   // ACES (Narkowicz)
+    float v = smoothstep(1.15, 0.30, length(vUv - 0.5) * 1.55);
+    c *= mix(1.0, v, uVignette);                                 // vignette: focus + guaranteed text contrast at the edges
+    c += (hash(vUv * uRes + uTime * 60.0) - 0.5) * uGrain;       // animated film grain
+    c += (hash(vUv * 1024.0) - 0.5) / 255.0;                     // dither: kills banding in dark gradients (OLED!)
+    fragColor = vec4(c, 1.0);
+  }`;
+
+  /* GL helpers -------------------------------------------------------------- */
+  function compile(type, src) {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(s) + '\n' + src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n'));
+    return s;
+  }
+  function program(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);   // uniform locations cached once — never look them up in the loop
+    for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name.replace('[0]', ''); u[name] = gl.getUniformLocation(p, name); }
+    return { p, u };
+  }
+  function target(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, hasFloat ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, hasFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fb, w, h };
+  }
+  const freeTarget = t => { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } };
+  function setUniforms(u, obj) {           // generic upload for CONFIG.subject: numbers and short arrays
+    for (const k in obj) {
+      const loc = u[k]; if (loc == null) continue;
+      const v = obj[k];
+      if (typeof v === 'number') gl.uniform1f(loc, v);
+      else if (v.length === 2) gl.uniform2fv(loc, v);
+      else if (v.length === 3) gl.uniform3fv(loc, v);
+      else if (v.length === 4) gl.uniform4fv(loc, v);
+    }
+  }
+  function bindTex(unit, tex, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); }
+
+  /* resources (rebuilt on context restore) ---------------------------------- */
+  const LEVELS = 5;
+  let P = null, vao = null, total = 0, scene = null, pyramid = [], screenVao = null, dpr = 1, lost = false;
+
+  function buildPrograms() {
+    P = { points: program(VS_POINTS, FS_POINTS), bright: program(VS_SCREEN, FS_BRIGHT),
+          tent: program(VS_SCREEN, FS_TENT), composite: program(VS_SCREEN, FS_COMPOSITE),
+          field: FS_FIELD ? program(VS_SCREEN, FS_FIELD) : null };
+    screenVao = gl.createVertexArray();          // empty VAO: the fullscreen triangle comes from gl_VertexID
+  }
+
+  function buildGeometry() {
+    const N = config.count, F = Math.round(N * config.backgroundRatio);
+    total = N + F;
+    const s = opts.generateSubject(N);
+    const seed = new Float32Array(total * 4), dna = new Float32Array(total * 4), scatter = new Float32Array(total * 4);
+    seed.set(s.seed); dna.set(s.dna); scatter.set(s.scatter);
+    for (let i = N; i < total; i++) {                                  // background layer: engine-owned
+      seed[i * 4] = Math.random(); seed[i * 4 + 1] = Math.random() * 6.2832;
+      dna[i * 4] = 0.8 + Math.pow(Math.random(), 3) * 3.2; dna[i * 4 + 1] = 0.15 + Math.random() * 0.5;
+      dna[i * 4 + 2] = Math.random() < 0.2 ? Math.random() : 0; dna[i * 4 + 3] = Math.random() * 6.2832;
+      scatter[i * 4] = (Math.random() * 2 - 1) * 1.1; scatter[i * 4 + 1] = (Math.random() * 2 - 1) * 1.1;
+      scatter[i * 4 + 2] = Math.random(); scatter[i * 4 + 3] = 1;
+    }
+    if (vao) gl.deleteVertexArray(vao);
+    vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const attr = (name, data) => {
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(P.points.p, name); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, 0, 0);
+    };
+    attr('aSeed', seed); attr('aDna', dna); attr('aScatter', scatter);
+    gl.bindVertexArray(null);
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);                   // DPR 3 on a full screen is 2.25× the pixels of DPR 2 — never worth it
+    const w = Math.max(2, Math.floor(canvas.clientWidth * dpr)), h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
+    if (canvas.width === w && canvas.height === h && scene) return;
+    canvas.width = w; canvas.height = h;
+    freeTarget(scene); pyramid.forEach(freeTarget);
+    scene = target(w, h); pyramid = [];
+    for (let i = 0, pw = w, ph = h; i < LEVELS; i++) { pw = Math.max(2, pw >> 1); ph = Math.max(2, ph >> 1); pyramid.push(target(pw, ph)); }
+  }
+
+  function init() { buildPrograms(); buildGeometry(); scene = null; pyramid = []; resize(); }
+  init();
+
+  /* interaction state -------------------------------------------------------- */
+  const st = { pointer: [0, 0], pointerTarget: [0, 0], lensLive: 0, exhale: 0, scroll: 0, scrollTarget: 0, intro: 0, t: 0, visible: true, reducedOverride: null };
+  const mq = matchMedia('(prefers-reduced-motion: reduce)');
+  const reduced = () => st.reducedOverride ?? mq.matches;
+  const toNdc = e => { const r = canvas.getBoundingClientRect(); return [((e.clientX - r.left) / r.width) * 2 - 1, 1 - ((e.clientY - r.top) / r.height) * 2]; };
+  const onMove = e => { st.pointerTarget = toNdc(e); st.lensLive = 1; };
+  const onOut = e => { if (!e.relatedTarget) st.lensLive = 0; };          // pointer left the window
+  const onDown = () => { st.exhale = 0.32; };
+  const onWheel = e => { st.scrollTarget = Math.max(-1, Math.min(1, st.scrollTarget + e.deltaY * 0.0012)); };
+  const onResize = () => resize();
+  const onLost = e => { e.preventDefault(); lost = true; document.body.classList.add('no-webgl'); };
+  const onRestored = () => { lost = false; init(); document.body.classList.remove('no-webgl'); };
+  window.addEventListener('pointermove', onMove, { passive: true });
+  document.addEventListener('pointerout', onOut);
+  window.addEventListener('pointerdown', onDown);
+  window.addEventListener('wheel', onWheel, { passive: true });
+  window.addEventListener('resize', onResize);
+  const ro = window.ResizeObserver ? new ResizeObserver(onResize) : null; ro?.observe(canvas);   // also catches container resizes
+  canvas.addEventListener('webglcontextlost', onLost);
+  canvas.addEventListener('webglcontextrestored', onRestored);
+  // Off-screen: stop rendering. The observer is a hint; before actually pausing, confirm with the rect —
+  // some embedded/prerendered contexts report "not intersecting" once and never update.
+  const io = new IntersectionObserver(([e]) => { st.visible = e.isIntersecting; }); io.observe(canvas);
+  const onScreen = () => { if (st.visible) return true; const r = canvas.getBoundingClientRect();
+    return r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth; };
+
+  /* frame loop --------------------------------------------------------------- */
+  const stats = { fps: 0, points: 0, dpr: 1, hdr: hasFloat };
+  let raf = 0, last = performance.now(), acc = 0, frames = 0;
+
+  function pass(prog, dst) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+    gl.viewport(0, 0, dst ? dst.w : canvas.width, dst ? dst.h : canvas.height);
+    gl.useProgram(prog.p); gl.bindVertexArray(screenVao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  function frame(now) {
+    raf = requestAnimationFrame(frame);
+    if (lost || document.hidden || !onScreen()) { last = now; return; }      // hidden tab / off-screen: burn nothing
+    const dt = Math.min((now - last) / 1000, 1 / 30);                       // clamp: a hidden tab must not cause a time jump
+    last = now;
+    step(dt);
+  }
+
+  function step(dt) {                                                        // one simulation + render step; also exposed for deterministic captures
+    if (lost || !scene) return;
+    const calm = reduced();
+    if (!calm) st.t += dt;                                                   // frozen clock = every time-driven motion stops
+
+    const k = 1 - Math.pow(0.001, dt);                                       // framerate-independent smoothing (never a fixed 0.1 lerp)
+    st.pointer[0] += (st.pointerTarget[0] - st.pointer[0]) * k;
+    st.pointer[1] += (st.pointerTarget[1] - st.pointer[1]) * k;
+    st.scroll += (st.scrollTarget - st.scroll) * k * 0.6;
+    st.scrollTarget *= 1 - dt * 0.8;                                         // scroll always settles back
+    st.exhale *= Math.pow(0.06, dt);
+    st.intro = calm ? 1 : Math.min(1, st.intro + dt / config.intro.duration);
+    const introEased = 1 - Math.pow(1 - st.intro, 3);
+    const aspect = canvas.width / canvas.height;
+
+    /* [0] + [1] scene -> HDR buffer */
+    gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fb);
+    gl.viewport(0, 0, scene.w, scene.h);
+    gl.disable(gl.BLEND);
+    if (P.field) {
+      gl.useProgram(P.field.p);
+      const u = P.field.u;
+      gl.uniform1f(u.uTime, st.t); gl.uniform1f(u.uAspect, aspect); gl.uniform1f(u.uReduced, calm ? 1 : 0);
+      gl.uniform2f(u.uPointer, st.pointer[0], st.pointer[1]); gl.uniform2f(u.uRes, scene.w, scene.h);
+      setUniforms(u, config.subject);
+      gl.bindVertexArray(screenVao); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    } else {
+      gl.clearColor(config.clearColor[0], config.clearColor[1], config.clearColor[2], 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);                       // additive: light adds up
+    gl.useProgram(P.points.p);
+    const U = P.points.u;
+    gl.uniform1f(U.uTime, st.t); gl.uniform1f(U.uAspect, aspect); gl.uniform1f(U.uPixelRatio, dpr); gl.uniform1f(U.uReduced, calm ? 1 : 0);
+    gl.uniform1f(U.uTwinkle, calm ? 0 : config.twinkleSpeed); gl.uniform1f(U.uSizeScale, config.sizeScale);
+    gl.uniform1f(U.uBreath, calm ? 0 : config.breath); gl.uniform1f(U.uMaxPointSize, Math.min(config.maxPointSize, pointRange[1]));
+    gl.uniform1f(U.uIntro, introEased); gl.uniform1f(U.uPropagation, config.intro.propagation);
+    gl.uniform1f(U.uExhale, calm ? 0 : st.exhale);
+    gl.uniform1f(U.uScrollDrift, st.scroll * config.scroll.drift); gl.uniform1f(U.uScrollScatter, Math.abs(st.scroll) * config.scroll.scatter);
+    gl.uniform1f(U.uScrollSize, 1 - Math.abs(st.scroll) * config.scroll.shrink);
+    gl.uniform2f(U.uLensPointer, st.pointer[0], st.pointer[1]);
+    gl.uniform1f(U.uLensActive, (config.lens.enabled && st.lensLive && !calm) ? 1 : 0);
+    gl.uniform1f(U.uLensRadius, config.lens.radius); gl.uniform1f(U.uLensMag, config.lens.magnification); gl.uniform1f(U.uLensIllum, config.lens.illumination);
+    gl.uniform3fv(U.uCool, config.palette.cool); gl.uniform3fv(U.uWarm, config.palette.warm);
+    setUniforms(U, config.subject);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.POINTS, 0, total);                                      // the whole subject in ONE draw call
+    gl.disable(gl.BLEND);
+
+    /* [2] luminance cut */
+    gl.useProgram(P.bright.p);
+    gl.uniform1f(P.bright.u.uThreshold, config.post.threshold);
+    bindTex(0, scene.tex, P.bright.u.uSrc);
+    pass(P.bright, pyramid[0]);
+
+    /* [3] down the pyramid */
+    gl.useProgram(P.tent.p);
+    for (let i = 1; i < LEVELS; i++) {
+      const src = pyramid[i - 1];
+      gl.uniform2f(P.tent.u.uTexel, 1 / src.w, 1 / src.h); gl.uniform1f(P.tent.u.uRadius, 1.0);
+      bindTex(0, src.tex, P.tent.u.uSrc); pass(P.tent, pyramid[i]);
+    }
+    /* [4] back up, additively (this is what makes the halo wide and soft) */
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    for (let i = LEVELS - 1; i > 0; i--) {
+      const src = pyramid[i];
+      gl.uniform2f(P.tent.u.uTexel, 1 / src.w, 1 / src.h); gl.uniform1f(P.tent.u.uRadius, 2.0);
+      bindTex(0, src.tex, P.tent.u.uSrc); pass(P.tent, pyramid[i - 1]);
+    }
+    gl.disable(gl.BLEND);
+
+    /* [5] composite to screen */
+    gl.useProgram(P.composite.p);
+    const C = P.composite.u;
+    gl.uniform1f(C.uBloomIntensity, config.post.bloom); gl.uniform1f(C.uExposure, config.post.exposure);
+    gl.uniform1f(C.uGrain, calm ? config.post.grain * 0.4 : config.post.grain); gl.uniform1f(C.uVignette, config.post.vignette);
+    gl.uniform1f(C.uTime, calm ? 0 : st.t); gl.uniform2f(C.uRes, canvas.width, canvas.height);
+    bindTex(0, scene.tex, C.uScene); bindTex(1, pyramid[0].tex, C.uBloom);
+    pass(P.composite, null);
+
+    frames++; acc += dt;
+    if (acc > 0.5) { stats.fps = Math.round(frames / acc); stats.points = total; stats.dpr = dpr; frames = 0; acc = 0; }
+  }
+  raf = requestAnimationFrame(frame);
+
+  return {
+    config, stats,
+    replayIntro() { st.intro = 0; },
+    rebuild() { buildGeometry(); },                                          // after changing config.count or the subject's shape
+    setReducedMotion(v) { st.reducedOverride = v; },                         // true/false to force, null = follow the OS setting
+    step,                                                                    // step(1/60) × N: advance deterministically (tests, poster frames, video capture)
+    destroy() {
+      cancelAnimationFrame(raf); io.disconnect(); ro?.disconnect();
+      window.removeEventListener('pointermove', onMove); document.removeEventListener('pointerout', onOut);
+      window.removeEventListener('pointerdown', onDown); window.removeEventListener('wheel', onWheel);
+      window.removeEventListener('resize', onResize);
+      canvas.removeEventListener('webglcontextlost', onLost); canvas.removeEventListener('webglcontextrestored', onRestored);
+      freeTarget(scene); pyramid.forEach(freeTarget);
+      if (vao) gl.deleteVertexArray(vao);
+      for (const k in P) if (P[k]) gl.deleteProgram(P[k].p);
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+    }
+  };
+}
+
+/* ── 4. BOOT + debug keys ───────────────────────────────────────────────────── */
+const sceneApi = createScene(document.getElementById('scene'), { config: CONFIG, generateSubject, subjectGlsl: SUBJECT_GLSL, fieldGlsl: FIELD_GLSL });
+if (!sceneApi) document.body.classList.add('no-webgl');
+else {
+  const hud = document.getElementById('hud');
+  let simulateReduced = false;
+  addEventListener('keydown', e => {
+    if (e.key === 'h') hud.hidden = !hud.hidden;
+    if (e.key === 'i') sceneApi.replayIntro();
+    if (e.key === 'r') { simulateReduced = !simulateReduced; sceneApi.setReducedMotion(simulateReduced ? true : null); }
+  });
+  setInterval(() => { if (!hud.hidden) { const s = sceneApi.stats;
+    hud.textContent = `${s.fps} fps · ${(s.points / 1000).toFixed(1)}k pts · dpr ${s.dpr}\nhdr ${s.hdr ? 'rgba16f' : 'rgba8 (no float ext)'} · reduced ${simulateReduced ? 'simulated' : 'os'}`; } }, 500);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cinematic web animation — examples</title>
+<style>
+  :root { --bg:#07090f; --ink:#eef2f8; --muted:rgba(238,242,248,.55); --line:rgba(238,242,248,.12) }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif }
+  main { max-width:1100px; margin:0 auto; padding:48px 24px 80px }
+  h1 { font-size:28px; font-weight:600; letter-spacing:-.02em; margin:0 0 6px }
+  p.lead { color:var(--muted); margin:0 0 32px }
+  h2 { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin:36px 0 12px }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:12px }
+  a.card { display:block; padding:16px 16px 14px; border:1px solid var(--line); border-radius:12px; color:inherit; text-decoration:none;
+           background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,0)); transition:border-color .2s, transform .2s }
+  a.card:hover { border-color:rgba(238,242,248,.35); transform:translateY(-1px) }
+  a.card b { display:block; font-weight:600; margin-bottom:4px }
+  a.card span { color:var(--muted); font-size:13px }
+  kbd { font:12px ui-monospace, monospace; color:var(--muted) }
+</style>
+</head>
+<body>
+<main>
+  <h1>Cinematic web animation — examples</h1>
+  <p class="lead">Every page is one self-contained HTML file with zero dependencies. In the particle scenes: move the pointer (lens),
+    click (pulse), scroll (drift), <kbd>h</kbd> stats, <kbd>r</kbd> simulate reduced motion, <kbd>i</kbd> replay the intro.</p>
+
+  <h2>Particles — template-full</h2>
+  <div class="grid">
+    <a class="card" href="galaxy.html"><b>Galaxy</b><span>The reference: log-spiral, differential rotation, propagated intro</span></a>
+    <a class="card" href="nebula.html"><b>Nebula</b><span>Domain-warped clouds (field pass) + sparse stars</span></a>
+    <a class="card" href="starfield-warp.html"><b>Starfield / warp</b><span>Flying through a 3-D cloud with wrapping depth</span></a>
+    <a class="card" href="flow-field.html"><b>Flow field</b><span>Curl-noise strokes, stateless, with time-offset trails</span></a>
+    <a class="card" href="fireflies.html"><b>Fireflies</b><span>900 big soft lights, pow(sin) blinks, forest fog</span></a>
+    <a class="card" href="snow.html"><b>Snow</b><span>Wrapping fall with parallax and side wind</span></a>
+    <a class="card" href="lavender-field.html"><b>Lavender field</b><span>Ground-plane camera, swaying stalks, sunset sky, pollen</span></a>
+    <a class="card" href="lavender-sunflower-field.html"><b>Lavender + sunflowers</b><span>Denser field, two plant kinds in one layout</span></a>
+    <a class="card" href="ocean-waves.html"><b>Ocean</b><span>Point-cloud sea: summed waves, foam crests, glints</span></a>
+    <a class="card" href="text-morph.html"><b>Text morph</b><span>Rasterised targets, delayed per-particle morph</span></a>
+    <a class="card" href="globe.html"><b>Globe</b><span>Fibonacci sphere, noise continents, ring</span></a>
+    <a class="card" href="dna-helix.html"><b>DNA helix</b><span>Parametric strands with snapped rungs</span></a>
+    <a class="card" href="black-hole.html"><b>Black hole</b><span>Lensed accretion disk, photon ring, Doppler beaming</span></a>
+    <a class="card" href="path-trails.html"><b>Attractor trails</b><span>Precomputed Lorenz path, comets of light along it</span></a>
+  </div>
+
+  <h2>Fields — template-field</h2>
+  <div class="grid">
+    <a class="card" href="aurora.html"><b>Aurora</b><span>Curtains with crisp base, soft top, vertical rays</span></a>
+    <a class="card" href="liquid-gradient.html"><b>Liquid gradient</b><span>Brand-coloured blobs; works on light pages</span></a>
+    <a class="card" href="smoke-ink.html"><b>Smoke / ink</b><span>Rising, curling plume</span></a>
+  </div>
+
+  <h2>Templates</h2>
+  <div class="grid">
+    <a class="card" href="../template-full.html"><b>template-full.html</b><span>The engine with the galaxy subject</span></a>
+    <a class="card" href="../template-minimal.html"><b>template-minimal.html</b><span>150 lines, one draw call, no post</span></a>
+    <a class="card" href="../template-field.html"><b>template-field.html</b><span>One fullscreen shader (aurora)</span></a>
+  </div>
+</main>
+</body>
+</html>

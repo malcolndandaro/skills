@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aurora</title>
+<style>
+  html, body { margin:0; height:100%; background:#040611; overflow:hidden }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; pointer-events:none; z-index:0 }
+  body.no-webgl canvas { display:none }
+  body.no-webgl::before { content:""; position:fixed; inset:0; background:linear-gradient(180deg, #0b1a2e 0%, #061024 60%, #040611 100%) }
+  .caption { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none;
+    font:600 clamp(28px,7vw,84px)/1 system-ui, -apple-system, "Segoe UI", sans-serif; color:#f2f5fa; letter-spacing:-.03em }
+</style>
+</head>
+<body>
+<canvas id="scene" aria-hidden="true"></canvas>
+<div class="caption">Aurora</div>
+
+<script>
+'use strict';
+/* -----------------------------------------------------------------------------
+   FIELD SCENE — one fullscreen fragment shader (WebGL2, zero dependencies)
+   For subjects that are continuous fields rather than particles: aurora, nebula
+   clouds, liquid/mesh gradients, plasma, smoke, water caustics, sunsets.
+   Every pixel evaluates `field(uv, p, t)`; the composite (tone map, vignette,
+   grain, dither) runs in the same shader, so there is exactly one pass.
+   The same `field()` contract works as the background pass of template-full.html.
+   ----------------------------------------------------------------------------- */
+
+/* ===== SUBJECT BLOCK START ===== */
+// @template field
+/* AURORA — three curtains of light over a starry sky. A field subject: one fullscreen fragment shader, no particles.
+   Each curtain is a horizontal fbm ribbon with a crisp lower edge and a long soft fade upward, multiplied by
+   near-vertical striations (fbm stretched in y) so it reads as rays, not blobs. Green low, violet high, like the real thing.
+   Knobs: uSpeed, uIntensity. Runs well at resolutionScale 0.6–0.75 because everything is smooth. */
+
+/* 1 ─ CONFIG ---------------------------------------------------------------------- */
+const CONFIG = {
+  resolutionScale: 0.7,
+  post: { exposure: 1.0, grain: 0.035, vignette: 0.3 },
+  subject: { uSpeed: 1.0, uIntensity: 1.0 },
+};
+
+/* 2 ─ FIELD ---------------------------------------------------------------------- */
+const FIELD_GLSL = /* glsl */`
+uniform float uSpeed, uIntensity;
+
+vec3 field(vec2 uv, vec2 p, float t) {
+  t *= uSpeed;
+  vec3 col = mix(vec3(0.02, 0.03, 0.09), vec3(0.004, 0.006, 0.025), uv.y);      // horizon glow -> zenith
+
+  // Stars: hashed grid, a few cells lit, individual twinkle.
+  vec2 g = p * 70.0; vec2 cell = floor(g); vec2 f = fract(g) - 0.5;
+  float h = hash21(cell);
+  vec2 sp = (vec2(hash21(cell + 7.0), hash21(cell + 13.0)) - 0.5) * 0.7;
+  float star = smoothstep(0.12, 0.0, length(f - sp)) * step(0.93, h);
+  col += star * (0.55 + 0.45 * sin(t * 2.0 + h * 40.0)) * 0.7 * smoothstep(0.2, 0.7, uv.y);
+
+  // Curtains.
+  for (int i = 0; i < 3; i++) {
+    float fi = float(i);
+    float x = p.x * (1.0 + fi * 0.2) + fi * 4.7;
+    float base = 0.26 + fi * 0.12 + fbm(vec2(x * 0.8 + t * 0.05, fi * 3.0 + t * 0.03)) * 0.35;   // where it touches down
+    float y = uv.y - base;
+    float height = 0.25 + fbm(vec2(x * 1.6 - t * 0.04, fi + 9.0)) * 0.35;                       // how far up it reaches
+    float body = smoothstep(0.0, 0.03, y) * pow(smoothstep(height, 0.0, y), 1.5);              // crisp bottom, long fade up
+    float rays = pow(fbm(vec2(x * 7.0 + t * 0.12, y * 0.6)), 2.2) * 2.2;                        // vertical striations
+    float glow = body * (0.35 + rays) * uIntensity;
+    vec3 c = mix(vec3(0.05, 0.90, 0.45), vec3(0.50, 0.20, 0.95), smoothstep(0.0, height, y));   // green low, violet high
+    col += c * glow * (0.5 - fi * 0.12);
+  }
+  return col;
+}`;
+/* ===== SUBJECT BLOCK END ===== */
+
+/* 3 ─ ENGINE ------------------------------------------------------------------------ */
+const VS = `#version 300 es
+out vec2 vUv;
+void main(){ vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); vUv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 fragColor;
+uniform float uTime, uAspect, uReduced, uExposure, uGrain, uVignette;
+uniform vec2 uPointer, uRes;
+
+// ── noise helpers (see references/shader-cookbook.md for simplex + curl) ──
+float hash21(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x), mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y); }
+float fbm(vec2 p){ float v = 0.0, a = 0.5; mat2 R = mat2(0.8, 0.6, -0.6, 0.8);
+  for (int i = 0; i < 5; i++) { v += a * vnoise(p); p = R * p * 2.02 + 17.3; a *= 0.5; } return v; }
+
+${FIELD_GLSL}
+
+void main(){
+  vec2 p = vUv * 2.0 - 1.0; p.x *= uAspect;
+  vec3 c = field(vUv, p, uTime) * uExposure;
+  c = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);   // ACES
+  c *= mix(1.0, smoothstep(1.15, 0.30, length(vUv - 0.5) * 1.55), uVignette);
+  c += (hash21(vUv * uRes + uTime * 60.0) - 0.5) * uGrain;                           // grain
+  c += (hash21(vUv * 1024.0) - 0.5) / 255.0;                                          // dither
+  fragColor = vec4(c, 1.0);
+}`;
+
+const canvas = document.getElementById('scene');
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, powerPreference: 'high-performance' });
+if (!gl) { document.body.classList.add('no-webgl'); throw new Error('WebGL2 unavailable'); }
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s) + '\n' + src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n'));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.bindVertexArray(gl.createVertexArray());                      // empty VAO; the triangle comes from gl_VertexID
+const u = {}; for (let i = 0, n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS); i < n; i++) { const nm = gl.getActiveUniform(prog, i).name; u[nm] = gl.getUniformLocation(prog, nm); }
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2) * CONFIG.resolutionScale;
+  canvas.width = Math.max(2, Math.floor(canvas.clientWidth * dpr)); canvas.height = Math.max(2, Math.floor(canvas.clientHeight * dpr));
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener('resize', resize); resize();
+
+let pointer = [0, 0], target = [0, 0];
+addEventListener('pointermove', e => { target = [(e.clientX / innerWidth) * 2 - 1, 1 - (e.clientY / innerHeight) * 2]; }, { passive: true });
+
+const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+let t = 0, last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (document.hidden) { last = now; return; }
+  const dt = Math.min((now - last) / 1000, 1 / 30); last = now;
+  const calm = reduced.matches;
+  if (!calm) t += dt;
+  const k = 1 - Math.pow(0.001, dt);
+  pointer[0] += (target[0] - pointer[0]) * k; pointer[1] += (target[1] - pointer[1]) * k;
+
+  gl.uniform1f(u.uTime, t); gl.uniform1f(u.uAspect, canvas.width / canvas.height); gl.uniform1f(u.uReduced, calm ? 1 : 0);
+  gl.uniform1f(u.uExposure, CONFIG.post.exposure); gl.uniform1f(u.uGrain, calm ? CONFIG.post.grain * 0.4 : CONFIG.post.grain);
+  gl.uniform1f(u.uVignette, CONFIG.post.vignette);
+  gl.uniform2f(u.uPointer, pointer[0], pointer[1]); gl.uniform2f(u.uRes, canvas.width, canvas.height);
+  for (const k in CONFIG.subject) { const v = CONFIG.subject[k], loc = u[k]; if (loc == null) continue;
+    typeof v === 'number' ? gl.uniform1f(loc, v) : v.length === 2 ? gl.uniform2fv(loc, v) : v.length === 3 ? gl.uniform3fv(loc, v) : gl.uniform4fv(loc, v); }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
