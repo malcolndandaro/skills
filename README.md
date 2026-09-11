@@ -6,6 +6,7 @@ a `SKILL.md` with instructions plus bundled `assets/`, `references/` and `script
 | Skill | What it does |
 |---|---|
 | [`cinematic-web-animation/`](cinematic-web-animation/) | Builds cinematic, GPU-driven web animations and generative art scenes as zero-dependency single-file WebGL2 (galaxies, nebulae, auroras, flow fields, fireflies, flower fields, oceans, globes, text morphs, black holes…) with HDR bloom, film grain, pointer/scroll interaction, a propagated intro and `prefers-reduced-motion` built in. |
+| [`databricks-transform-pattern/`](databricks-transform-pattern/) | Structures PySpark / Spark SQL ETL on Databricks as small, pure, chainable `DataFrame`-to-`DataFrame` functions composed with `DataFrame.transform()` — modular, reusable, and unit-testable. Covers batch, Structured Streaming, and Lakeflow Spark Declarative Pipelines (SDP, formerly DLT), with pytest guidance and copy-ready transform + test templates. |
 
 ## Installing a skill
 
@@ -39,3 +40,21 @@ To browse the examples locally:
 cd skills/cinematic-web-animation && python -m http.server 8765
 # open http://localhost:8765/assets/examples/
 ```
+
+## databricks-transform-pattern at a glance
+
+- `SKILL.md` — core rules (pure `df -> df`, one responsibility, no side effects, separate I/O
+  from logic), the pattern, chaining and parameterization, a review checklist, and pointers to
+  the references. Triggers by default on any Databricks transformation / pipeline / SDP / ETL work.
+- `references/testing.md` — pytest on a local SparkSession: fixture, `assertDataFrameEqual` /
+  `chispa`, and making non-deterministic transforms testable.
+- `references/sdp-lakeflow.md` — applying the pattern in Structured Streaming and Lakeflow SDP;
+  modern `@dp` vs legacy `@dlt`, and the bronze/silver/gold mapping.
+- `references/advanced-patterns.md` — kwargs vs closures, multi-DataFrame joins, dynamic
+  pipelines with `functools.reduce`, stateful transforms, aggregations/windows, and performance.
+- `assets/spark_transform_functions.py` + `assets/test_spark_transform_functions.py` — a
+  ready-to-copy `utils/` transform module and its matching pytest suite.
+
+Then ask Claude to "clean up / modularize this Spark pipeline", "make these transformations
+testable", or just write PySpark ETL — the skill triggers on its own, or invoke it explicitly
+with `/databricks-transform-pattern`.
