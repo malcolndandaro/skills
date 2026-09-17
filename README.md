@@ -3,10 +3,18 @@
 A collection of custom skills for [Claude Code](https://claude.com/claude-code). Each top-level folder is one skill:
 a `SKILL.md` with instructions plus bundled `assets/`, `references/` and `scripts/`.
 
+These are just the ones I keep here. My actual setup pulls skills from several sources —
+[Databricks Agent Skills](https://github.com/databricks/databricks-agent-skills),
+[Anthropic's skills](https://github.com/anthropics/skills), some of
+[Matt Pocock's skills](https://github.com/mattpocock/skills), and some personal/private ones
+that don't make sense to share — and I use those together with the skills in this repo to
+complement my workflow.
+
 | Skill | What it does |
 |---|---|
 | [`cinematic-web-animation/`](cinematic-web-animation/) | Builds cinematic, GPU-driven web animations and generative art scenes as zero-dependency single-file WebGL2 (galaxies, nebulae, auroras, flow fields, fireflies, flower fields, oceans, globes, text morphs, black holes…) with HDR bloom, film grain, pointer/scroll interaction, a propagated intro and `prefers-reduced-motion` built in. |
 | [`databricks-transform-pattern/`](databricks-transform-pattern/) | Structures PySpark / Spark SQL ETL on Databricks as small, pure, chainable `DataFrame`-to-`DataFrame` functions composed with `DataFrame.transform()` — modular, reusable, and unit-testable. Covers batch, Structured Streaming, and Lakeflow Spark Declarative Pipelines (SDP, formerly DLT), with pytest guidance and copy-ready transform + test templates. |
+| [`databricks-notebook-source-format/`](databricks-notebook-source-format/) | Authors Databricks code that runs in the workspace as source-format notebooks — plain `.py` files with `# Databricks notebook source`, `# COMMAND ----------`, and `# MAGIC` markers — by default, instead of ordinary scripts. Plain `.py` (and `spark_python_task` / wheels) only when explicitly asked; imported helper modules stay plain `.py`. Includes the exact format spec, a copy-ready notebook template, and a validator. Pairs with `databricks-transform-pattern` (notebook = orchestration, transforms = imported module). |
 
 ## Installing a skill
 
@@ -58,3 +66,19 @@ cd skills/cinematic-web-animation && python -m http.server 8765
 Then ask Claude to "clean up / modularize this Spark pipeline", "make these transformations
 testable", or just write PySpark ETL — the skill triggers on its own, or invoke it explicitly
 with `/databricks-transform-pattern`.
+
+## databricks-notebook-source-format at a glance
+
+- `SKILL.md` — the decision rule (notebook by default vs plain `.py` only when explicitly
+  asked), the exact source-notebook syntax (header, `# COMMAND ----------`, `# MAGIC` markdown /
+  SQL / `%run` / `%pip`, `# DBTITLE`, widgets), the "a magic cell is 100% `# MAGIC` lines" rule
+  that catches most mistakes, structure conventions, `notebook_task` wiring, and a checklist.
+- `references/format-spec.md` — the complete magic vocabulary (`%md-sandbox`, `%fs`, `%sh`,
+  `%scala`/`%r`, `%environment`), all widget types, the `base_parameters` ↔ widgets mapping,
+  editing existing notebooks, and CLI `export`/`import --format SOURCE`.
+- `assets/notebook_template.py` — a ready-to-copy source-format notebook skeleton.
+- `scripts/validate_notebook_source.py` — lints a `.py` notebook for header, separator,
+  `# MAGIC ` spacing, and mixed magic/code-cell mistakes.
+
+Then just ask Claude to "write a notebook that…" or "a job that runs this" — the skill triggers
+on its own, or invoke it explicitly with `/databricks-notebook-source-format`.
