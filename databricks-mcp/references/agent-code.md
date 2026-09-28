@@ -125,15 +125,17 @@ response = client.responses.create(
 
 ## B. ResponsesAgent on Model Serving, with identity outside the LLM's reach
 
-This pattern ran end to end (three smoke gates green). The end user's id comes from `custom_inputs`,
+This pattern ran end to end on Model Serving (three smoke gates green, endpoint serving it). An
+earlier version that handed the sync `call_tool` to a `ThreadPoolExecutor` also worked. It was
+replaced because `.result(timeout)` on a pool returns control but leaves the thread stuck on the
+slow call, while `asyncio.wait_for` on the private loop cancels it. The end user's id comes from `custom_inputs`,
 which the authenticated front end fills in. The LLM sees tools **without** an id parameter, so no
 prompt can make it query another account. The agent injects the session id when it calls the MCP tool.
 
 ```python
 # agent.py — logged with python_model="agent.py" (models from code)
-import json, re, uuid
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+import asyncio, json, os, re, threading, uuid
+from typing import Any, Coroutine
 
 import mlflow
 from databricks.sdk import WorkspaceClient
@@ -151,14 +153,43 @@ TOOLS = [{"type": "function", "function": {
     "name": "my_context", "description": "Current state of the signed-in customer's account.",
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}]
 
-_POOL = ThreadPoolExecutor(max_workers=4)
+_TOOL_TIMEOUT_S = 60
 
-def _call(client: DatabricksMCPClient, name: str, args: dict[str, Any]) -> str:
-    """Sync call_tool in a worker thread (it uses asyncio.run), with one retry for cold starts."""
+
+class _LoopThread:
+    """A private event loop on a daemon thread, to run coroutines from sync code.
+
+    predict() is sync and may run under a loop that is already running (a notebook), where the sync
+    call_tool (asyncio.run) fails and you can't await. The loop starts on first use and is recreated
+    if the PID changes: a thread started before a fork (serving workers) doesn't exist in the child.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._pid: int | None = None
+
+    def _ensure(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._loop is None or self._pid != os.getpid():
+                self._loop = asyncio.new_event_loop()
+                threading.Thread(target=self._loop.run_forever, name="mcp-loop", daemon=True).start()
+                self._pid = os.getpid()
+            return self._loop
+
+    def run(self, coro: Coroutine[Any, Any, str], timeout: float) -> str:
+        return asyncio.run_coroutine_threadsafe(coro, self._ensure()).result(timeout=timeout)
+
+
+_LOOP = _LoopThread()
+
+
+async def _acall(client: DatabricksMCPClient, name: str, args: dict[str, Any]) -> str:
+    """acall_tool with a timeout that CANCELS the call, and one retry for cold starts."""
     text = ""
     for _ in range(2):
         try:
-            res = _POOL.submit(client.call_tool, name, args).result(timeout=60)
+            res = await asyncio.wait_for(client.acall_tool(name, args), _TOOL_TIMEOUT_S)
             text = "\n".join(getattr(c, "text", "") for c in (res.content or []))
             # some upstream failures come back as text, not as isError
             if not getattr(res, "isError", False) and "Error calling tool" not in text:
@@ -166,6 +197,11 @@ def _call(client: DatabricksMCPClient, name: str, args: dict[str, Any]) -> str:
         except Exception as exc:  # surface as text so the LLM can apologise instead of crashing
             text = f"[tool error] {type(exc).__name__}"
     return text
+
+
+def _call(client: DatabricksMCPClient, name: str, args: dict[str, Any]) -> str:
+    """Sync bridge used by predict(): run _acall on the private loop."""
+    return _LOOP.run(_acall(client, name, args), timeout=2 * _TOOL_TIMEOUT_S + 10)
 
 
 class SupportAgent(ResponsesAgent):
@@ -258,7 +294,7 @@ with mlflow.start_run():
         name="agent", python_model="agent.py", model_config={...}, resources=resources,
         input_example={"input": [{"role": "user", "content": "hi"}],
                        "custom_inputs": {"entity_id": "<test-id>"}},
-        pip_requirements=["mlflow>=3.1", "databricks-mcp>=0.9.2", "databricks-sdk", "openai"],
+        pip_requirements=["mlflow>=3.1", "databricks-mcp>=0.9.2", "databricks-sdk", "openai"],  # 0.9.2+ has acall_tool
         registered_model_name="<catalog>.<schema>.<model>",
     )
 ```
