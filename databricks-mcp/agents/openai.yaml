@@ -1,0 +1,4 @@
+interface:
+  display_name: "Databricks MCP"
+  short_description: "Connect agents and MCP clients to Databricks managed MCP servers, MCP Services and custom MCP servers on Apps."
+  default_prompt: "Use $databricks-mcp to connect agents and MCP clients to Databricks managed MCP servers, MCP Services and custom MCP servers on Apps."

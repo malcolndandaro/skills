@@ -15,6 +15,7 @@ complement my workflow.
 | [`cinematic-web-animation/`](cinematic-web-animation/) | Builds cinematic, GPU-driven web animations and generative art scenes as zero-dependency single-file WebGL2 (galaxies, nebulae, auroras, flow fields, fireflies, flower fields, oceans, globes, text morphs, black holes…) with HDR bloom, film grain, pointer/scroll interaction, a propagated intro and `prefers-reduced-motion` built in. |
 | [`databricks-transform-pattern/`](databricks-transform-pattern/) | Structures PySpark / Spark SQL ETL on Databricks as small, pure, chainable `DataFrame`-to-`DataFrame` functions composed with `DataFrame.transform()` — modular, reusable, and unit-testable. Covers batch, Structured Streaming, and Lakeflow Spark Declarative Pipelines (SDP, formerly DLT), with pytest guidance and copy-ready transform + test templates. |
 | [`databricks-notebook-source-format/`](databricks-notebook-source-format/) | Authors Databricks code that runs in the workspace as source-format notebooks — plain `.py` files with `# Databricks notebook source`, `# COMMAND ----------`, and `# MAGIC` markers — by default, instead of ordinary scripts. Plain `.py` (and `spark_python_task` / wheels) only when explicitly asked; imported helper modules stay plain `.py`. Includes the exact format spec, a copy-ready notebook template, and a validator. Pairs with `databricks-transform-pattern` (notebook = orchestration, transforms = imported module). |
+| [`databricks-mcp/`](databricks-mcp/) | Connects agents and MCP clients to Databricks MCP servers — managed servers (Genie One, Genie Agent, AI Search, Databricks SQL, UC functions), MCP Services, and custom MCP servers on Databricks Apps. Covers URLs and OAuth scopes per server, agent code on Apps and on Model Serving, passthrough resources (and where `get_databricks_resources()` silently returns nothing), IDE/coding-agent setup, rate limits, load testing and audit trails. Follows the layout of the official Databricks agent skills (`parent: databricks-core`). |
 
 ## Installing a skill
 
@@ -82,3 +83,26 @@ with `/databricks-transform-pattern`.
 
 Then just ask Claude to "write a notebook that…" or "a job that runs this" — the skill triggers
 on its own, or invoke it explicitly with `/databricks-notebook-source-format`.
+
+## databricks-mcp at a glance
+
+- `SKILL.md` — which server to pick (URL and OAuth scope for each, plus the legacy forms that still
+  answer), auth rules (OAuth vs PAT, no inbound DCR, scope pitfalls), the smallest working calls
+  (curl JSON-RPC and `DatabricksMCPClient`), hosting choice for agents, the passthrough-resources
+  table, and a dozen field-tested gotchas.
+- `references/servers.md` — each managed server's tools, argument shapes, `_meta` parameters,
+  built-in `system.ai.*` MCP Services, and deprecations.
+- `references/clients.md` — Claude Code (including a `headersHelper` that mints the token from the
+  Databricks CLI), `mcp-remote`, the Unity Gateway CLI, and OAuth app setup.
+- `references/agent-code.md` — agents on Databricks Apps (OpenAI Agents SDK, LangGraph, bundle
+  resources) and a ResponsesAgent on Model Serving that keeps the end user's id out of the LLM's
+  reach, with smoke gates and a deploy that runs as a service principal.
+- `references/services-and-custom-servers.md` — registering an external MCP server as an MCP
+  Service, the legacy UC-connection route, and a FastMCP server on Apps that holds up under load.
+- `references/limits-and-audit.md` — per-workspace QPS limits, how to load test (goodput, think
+  time, jitter), and where each MCP call type lands in the audit tables.
+
+It follows the official Databricks agent skills layout (`parent: databricks-core`), so install the
+[Databricks Agent Skills](https://github.com/databricks/databricks-agent-skills) too. Then ask Claude
+to "connect my agent to a Genie space over MCP", "why does my deployed agent get PERMISSION_DENIED",
+or "add this MCP server to Claude Code" — or invoke it with `/databricks-mcp`.
