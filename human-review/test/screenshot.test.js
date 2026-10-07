@@ -147,3 +147,45 @@ test("screenshot renderer releases vendor references after abort and load error"
     assert.equal(window.document.querySelectorAll("script[data-eh-sdk]").length, 0);
   });
 });
+
+test("a renderer that never settles gives up on abort and on timeout", { concurrency: false }, async () => {
+  await withCaptureDom(async (window) => {
+    const started = [];
+    installRenderer(window, () => ({
+      // Like html-to-image when an image decode rejects: the promise never settles.
+      toCanvas: () => {
+        started.push(Date.now());
+        return new Promise(() => {});
+      },
+    }));
+    const { capturePage } = await freshScreenshotModule();
+
+    const controller = new AbortController();
+    const pending = capturePage("viewport", { signal: controller.signal });
+    while (!started.length) await new Promise((done) => setTimeout(done, 5));
+    controller.abort();
+    await assert.rejects(pending, { name: "AbortError" }, "cancel settles without waiting on the renderer");
+    assert.equal(window.document.querySelectorAll("script[data-eh-sdk]").length, 0);
+
+    const t0 = Date.now();
+    await assert.rejects(capturePage("viewport", { renderTimeoutMs: 50 }), /took too long to render/);
+    assert.ok(Date.now() - t0 < 2000, "the timeout ends the capture");
+    assert.equal(window.document.querySelectorAll("script[data-eh-sdk]").length, 0);
+  });
+});
+
+test("a canvas that arrives after the capture gave up is released", { concurrency: false }, async () => {
+  await withCaptureDom(async (window) => {
+    const finish = deferred();
+    installRenderer(window, () => ({ toCanvas: () => finish.promise }));
+    const { capturePage } = await freshScreenshotModule();
+
+    await assert.rejects(capturePage("viewport", { renderTimeoutMs: 20 }), /took too long/);
+    const canvas = window.document.createElement("canvas");
+    canvas.width = 240;
+    canvas.height = 160;
+    finish.resolve(canvas);
+    await new Promise((done) => setTimeout(done, 0));
+    assert.deepEqual([canvas.width, canvas.height], [0, 0]);
+  });
+});

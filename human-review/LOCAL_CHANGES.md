@@ -4,7 +4,7 @@ This skill extends [Peter Yang's Human Review](https://github.com/petergyang/hum
 v0.8.2 from the original `malcoln/review-improvements` branch. Peter Yang's original
 MIT license and copyright are preserved in `LICENSE`.
 The canonical source is now the `human-review/` folder in the personal skills repo.
-The local package version is `0.8.2-malcoln.3`.
+The local package version is `0.8.2-malcoln.4`.
 
 Install dependencies with `npm ci`, then run `node scripts/install-local.mjs`.
 The installer writes `~/.local/bin/human-review` pointing to this folder and links
@@ -138,3 +138,20 @@ batch, preserving the changed HTML and omitting the superseded removal request.
 Regression coverage passes 161 tests. Chromium verified two active, changed-text
 comments becoming zero active comments and two Completed cards after confirmation.
 Artifacts: `output/completion-tests.log`, `output/completion-smoke/completed-history.png`.
+
+## Stuck screenshot captures
+
+Version `0.8.2-malcoln.4` keeps the protocol at 12. A region capture could hold
+Send on "Capturing screenshot…" for good. Clicking Add comment before the drag
+finished saved the comment but left its capture running, with nowhere to land;
+and a capture that ended by cancel or error refreshed only the toolbar, so Send
+kept the stale label and stayed disabled. Add comment now cancels the comment's
+pending capture and says the screenshot was left out, and every capture start or
+end redraws Send. The renderer also gives up after 20 seconds or on cancel,
+since html-to-image never settles when an image decode rejects; a canvas that
+arrives late is released.
+
+Regression coverage passes 163 tests, including a renderer that never settles.
+Chromium verified Add comment during a pending selection (Send freed, toast
+shown), a normal region capture still attaching, and Esc with a typed draft.
+A review tab stuck on the old client recovers with a reload; its comments stay.

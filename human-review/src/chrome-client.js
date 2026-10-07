@@ -184,6 +184,8 @@ function cancelCaptures() {
   state.captures.clear();
   clearCaptureHint();
   if (hadCapture) dismissEmptyScreenshotCompose();
+  // Send reads state.captures too; renderToolbar alone left it on "Capturing".
+  render();
   renderToolbar();
 }
 
@@ -894,6 +896,7 @@ function startCapture(mode) {
   screenshotCompose(mode);
   const id = screenshotId();
   state.captures.set(id, { id, key: state.key, mode });
+  render();
   renderToolbar();
   if (mode === "region") showCaptureHint();
   toFrame({ type: "eh:capture", id, mode });
@@ -920,6 +923,7 @@ async function receiveCapture(message) {
   if (!capture) return;
   state.captures.delete(message.id);
   clearCaptureHint();
+  render();
   renderToolbar();
   if (capture.key !== state.key) return;
   if (message.cancelled) {
@@ -1058,6 +1062,12 @@ async function commitCompose() {
     state.page = result.page;
     state.active = result.comment.id;
     state.sent = false;
+    // A capture still running belonged to this comment, which is saved now.
+    // Left alone, it would hold Send on "Capturing" with nowhere to land.
+    if (state.captures.size) {
+      cancelCaptures();
+      toast("Comment added without the screenshot, which was not captured yet");
+    }
     render();
   } catch (err) {
     toast(err.message);

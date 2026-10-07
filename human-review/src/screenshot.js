@@ -31,6 +31,30 @@ function checkAborted(signal) {
   if (signal?.aborted) throw new DOMException("Screenshot cancelled.", "AbortError");
 }
 
+const RENDER_TIMEOUT_MS = 20_000;
+
+/** The renderer can wait forever (html-to-image never catches a rejected image
+ * decode), so a capture gives up on abort or after the timeout instead of
+ * holding Send. A canvas that arrives after that is released, not kept. */
+function renderWithin(rendering, signal, ms = RENDER_TIMEOUT_MS) {
+  let settled = false;
+  let timer = null;
+  let onAbort = null;
+  const stop = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("The screenshot took too long to render. Try Viewport, or attach an image with Upload.")), ms);
+    onAbort = () => reject(new DOMException("Screenshot cancelled.", "AbortError"));
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  rendering.then((canvas) => {
+    if (settled && canvas) canvas.width = canvas.height = 0;
+  }, () => {});
+  return Promise.race([rendering, stop]).finally(() => {
+    settled = true;
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  });
+}
+
 /** The bundled renderer retains resource data URLs in a module-level cache.
  * Remove its script and namespace after each capture so dynamic assets cannot
  * accumulate in the review iframe. */
@@ -89,7 +113,7 @@ function renderer() {
 }
 
 /** Capture the current edited document, excluding review controls. */
-export async function capturePage(mode = "viewport", { region, strokes = [], signal } = {}) {
+export async function capturePage(mode = "viewport", { region, strokes = [], signal, renderTimeoutMs } = {}) {
   checkAborted(signal);
   const full = mode === "full";
   const root = document.documentElement;
@@ -121,7 +145,7 @@ export async function capturePage(mode = "viewport", { region, strokes = [], sig
     const rootColor = getComputedStyle(root).backgroundColor;
     const bodyColor = getComputedStyle(document.body).backgroundColor;
     const opaque = (color) => color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)";
-    canvas = await render(root, {
+    canvas = await renderWithin(render(root, {
       width,
       height,
       canvasWidth: Math.max(1, Math.floor(width * size.scale)),
@@ -132,7 +156,7 @@ export async function capturePage(mode = "viewport", { region, strokes = [], sig
       fetchRequestInit: { signal: fetchAbort.signal },
       style: full ? {} : { transform: `translate(${-scrollX}px, ${-scrollY}px)`, transformOrigin: "top left" },
       filter: (node) => node.nodeType !== 1 || (!node.hasAttribute("data-eh-ui") && !node.hasAttribute("data-eh-sdk")),
-    });
+    }), signal, renderTimeoutMs);
     checkAborted(signal);
     if (!full && (window.scrollX !== scrollX || window.scrollY !== scrollY || window.innerWidth !== width || window.innerHeight !== height)) {
       throw new Error("The page moved during capture. Please select the area again.");
