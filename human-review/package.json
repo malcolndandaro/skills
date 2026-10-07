@@ -1,0 +1,56 @@
+{
+  "name": "human-review",
+  "version": "0.8.2-malcoln.3",
+  "description": "Review and edit agent-generated files and localhost pages in the browser, then send the whole batch back to your agent.",
+  "author": "Peter Yang",
+  "homepage": "https://github.com/malcolndandaro/skills/tree/main/human-review",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/malcolndandaro/skills.git",
+    "directory": "human-review"
+  },
+  "bugs": {
+    "url": "https://github.com/petergyang/human-review/issues"
+  },
+  "type": "module",
+  "bin": {
+    "human-review": "src/cli.js"
+  },
+  "files": [
+    "SKILL.md",
+    "src",
+    "scripts",
+    "assets",
+    "README.md",
+    "LOCAL_CHANGES.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-force-exit --test-timeout=60000",
+    "start": "node src/cli.js"
+  },
+  "keywords": [
+    "html",
+    "markdown",
+    "localhost",
+    "nextjs",
+    "review",
+    "comments",
+    "agent",
+    "claude-code",
+    "codex",
+    "cli"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^29.1.1"
+  },
+  "dependencies": {
+    "html-to-image": "^1.11.13",
+    "marked": "^18.0.7"
+  },
+  "private": true
+}

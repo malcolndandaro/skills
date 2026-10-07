@@ -16,6 +16,7 @@ complement my workflow.
 | [`databricks-transform-pattern/`](databricks-transform-pattern/) | Structures PySpark / Spark SQL ETL on Databricks as small, pure, chainable `DataFrame`-to-`DataFrame` functions composed with `DataFrame.transform()` — modular, reusable, and unit-testable. Covers batch, Structured Streaming, and Lakeflow Spark Declarative Pipelines (SDP, formerly DLT), with pytest guidance and copy-ready transform + test templates. |
 | [`databricks-notebook-source-format/`](databricks-notebook-source-format/) | Authors Databricks code that runs in the workspace as source-format notebooks — plain `.py` files with `# Databricks notebook source`, `# COMMAND ----------`, and `# MAGIC` markers — by default, instead of ordinary scripts. Plain `.py` (and `spark_python_task` / wheels) only when explicitly asked; imported helper modules stay plain `.py`. Includes the exact format spec, a copy-ready notebook template, and a validator. Pairs with `databricks-transform-pattern` (notebook = orchestration, transforms = imported module). |
 | [`databricks-mcp/`](databricks-mcp/) | Connects agents and MCP clients to Databricks MCP servers — managed servers (Genie One, Genie Agent, AI Search, Databricks SQL, UC functions), MCP Services, and custom MCP servers on Databricks Apps. Covers URLs and OAuth scopes per server, agent code on Apps and on Model Serving, passthrough resources (and where `get_databricks_resources()` silently returns nothing), IDE/coding-agent setup, rate limits, load testing and audit trails. Follows the layout of the official Databricks agent skills (`parent: databricks-core`). |
+| [`human-review/`](human-review/) | Reviews HTML, Markdown and localhost pages in the browser, with direct editing, comments, area screenshots and red pencil annotations. Based on [Peter Yang's Human Review](https://github.com/petergyang/human-review), with local improvements and resource diagnostics. |
 
 ## Installing a skill
 
@@ -32,6 +33,24 @@ cp -r skills/cinematic-web-animation <your-project>/.claude/skills/
 
 Then ask Claude for "an animated hero background like the OpenAI galaxy", "a lavender field at sunset", "particles that
 form our logo", and so on. The skill triggers on its own; you can also invoke it explicitly with `/cinematic-web-animation`.
+
+### Installing human-review
+
+Human Review includes a Node application. Install its dependencies and run its installer
+(Node.js 20 or newer; Node.js 24 or newer for the development tests):
+
+```bash
+cd skills/human-review
+npm ci
+node scripts/install-local.mjs
+```
+
+The installer links the skill into Claude Code, Codex and shared agent directories,
+and creates `~/.local/bin/human-review` pointing to this checkout. Existing skill
+installations and the managed command are backed up under
+`~/.local/state/human-review/skill-backups/`. Invoke it with `/human-review path/to/file.md`
+in Claude Code or `~/.local/bin/human-review path/to/file.md` from a terminal.
+See [human-review/README.md](human-review/README.md) for the review tools and diagnostics.
 
 ## cinematic-web-animation at a glance
 
