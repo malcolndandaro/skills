@@ -57,6 +57,24 @@ test("renderMarkdownPage produces a full document from gfm source", () => {
   assert.match(html, /<title>plan\.md<\/title>/);
 });
 
+test("rendered markdown uses the page width and declares its reading settings", () => {
+  const html = renderMarkdownPage("# Plan\n\n| a | b |\n| - | - |\n| 1 | 2 |\n", "/x/plan.md");
+  assert.match(html, /<meta name="human-review-reader" content="markdown">/, "the SDK only restyles pages that opt in");
+  assert.doesNotMatch(html, /max-width: 72ch/, "the old narrow column is gone");
+  assert.match(html, /--hr-measure: 68rem/, "the default measure is wide");
+  for (const value of ["narrow", "medium", "full"]) assert.match(html, new RegExp(`data-eh-width="${value}"`));
+  for (const value of ["sepia", "dark"]) assert.match(html, new RegExp(`data-eh-theme="${value}"`));
+  assert.match(html, /table \{ display: block; width: max-content; max-width: 100%; overflow-x: auto;/, "wide tables scroll instead of squeezing");
+});
+
+test("rendered markdown starts in the reader's settings, ignoring unknown values", async () => {
+  const { readerSettings } = await import("../src/reader.js");
+  assert.deepEqual(readerSettings(new URLSearchParams("theme=dark&width=full&size=huge&font=serif&t=1")), { width: "full", font: "serif", theme: "dark" });
+  const html = renderMarkdownPage("# Plan", "/x/plan.md", { theme: "dark", width: "x\" onload=\"1" });
+  assert.match(html, /<html lang="en" data-eh-theme="dark">/, "the page paints dark from the first frame");
+  assert.doesNotMatch(html, /onload/);
+});
+
 test("raw HTML in markdown is visible but never active", () => {
   const html = renderMarkdownPage(
     "# Hi\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(2)>\n\n<iframe src=\"https://evil.example\"></iframe>\n\n<svg onload=alert(3)><circle /></svg>\n\n<div>Kept text</div>\n\n[Bad link](javascript:alert(4))\n\n![Bad image](data:text/html,bad)\n",
@@ -102,6 +120,8 @@ test("a markdown review is rendered, flagged, and never writable", async (t) => 
   await t.test("the artifact route serves rendered html with the sdk injected", async () => {
     const res = await request(port, token, { route: `/artifact/${artifactToken}/${key}/index.html` });
     assert.equal(res.status, 200);
+    const dark = await request(port, token, { route: `/artifact/${artifactToken}/${key}/index.html?theme=dark&size=l` });
+    assert.match(dark.raw, /<html lang="en" data-eh-size="l" data-eh-theme="dark">/, "reading settings in the URL render into the page");
     assert.match(res.raw, /<h1[^>]*>Notes<\/h1>/);
     assert.match(res.raw, /data-eh-sdk/);
     assert.doesNotMatch(res.raw, /# Notes/, "raw markdown syntax does not leak through");
@@ -140,6 +160,18 @@ test("a markdown review is rendered, flagged, and never writable", async (t) => 
       route: `/api/page/${key}/comment`,
       body: { kind: "selection", quote: "First draft.", feedback: "Add a timeline." },
     });
+    const section = await request(port, token, {
+      method: "POST",
+      route: `/api/page/${key}/comment`,
+      body: { kind: "section", quote: "Notes", anchor: { heading: "Notes", level: 1, selector: "body > main > h1" }, feedback: "Shorten this section." },
+    });
+    assert.equal(JSON.parse(section.raw).comment.kind, "section", "a section comment keeps its kind");
+    const oversized = await request(port, token, {
+      method: "POST",
+      route: `/api/page/${key}/comment`,
+      body: { kind: "selection", quote: "x", anchor: { quote: "x", end: "y".repeat(5000), long: true }, feedback: "Too big." },
+    });
+    assert.equal(oversized.status, 400, "the closing part of a long anchor is bounded too");
     const sent = await request(port, token, {
       method: "POST",
       route: `/api/page/${key}/send`,
@@ -152,6 +184,7 @@ test("a markdown review is rendered, flagged, and never writable", async (t) => 
     // The server canonicalizes paths (symlinked tmpdirs on macOS), so match on realpath.
     const page = batch.pages.find((p) => p.file === fs.realpathSync(file));
     assert.equal(page.comments[0].feedback, "Add a timeline.");
+    assert.deepEqual(page.comments[1].anchor, { heading: "Notes", level: 1, selector: "body > main > h1" });
     assert.match(batch.next_step, /Markdown source/);
   });
 });

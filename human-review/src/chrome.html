@@ -8,8 +8,21 @@
 </head>
 <body data-session="__SESSION_ID__" data-token="__TOKEN__">
   <div class="app">
+    <aside class="toc" id="toc" aria-label="Contents" hidden>
+      <div class="toc-head">
+        <span class="section">Contents</span>
+        <span class="dim" id="tocMeta"></span>
+        <button type="button" id="tocClose" class="icon-btn" title="Hide contents" aria-label="Hide contents">‹</button>
+      </div>
+      <nav class="toc-list" id="tocList"></nav>
+    </aside>
+
     <main class="stage">
+      <div class="progress" id="progress" hidden><span id="progressBar"></span></div>
       <div class="stage-toolbar" role="toolbar" aria-label="Review tools">
+        <div class="tool-group" role="group" aria-label="Contents">
+          <button type="button" id="tocToggle" class="tool-btn" aria-pressed="false" title="Show contents" disabled>Contents</button>
+        </div>
         <div class="tool-group mode-group" role="group" aria-label="Review mode">
           <button type="button" id="modeEdit" class="tool-btn active" aria-pressed="true" title="Edit mode">Edit</button>
           <button type="button" id="modeRead" class="tool-btn" aria-pressed="false" title="Read mode">Read</button>
@@ -25,6 +38,10 @@
           <button type="button" class="tool-btn format-btn" data-format="redo" title="Redo (Cmd/Ctrl+Shift+Z)" aria-label="Redo">↷</button>
         </div>
         <div class="tool-spacer"></div>
+        <div class="tool-group" role="group" aria-label="Reading">
+          <button type="button" id="readerToggle" class="tool-btn" aria-expanded="false" title="Reading settings: width, text size, font and theme" hidden>Aa</button>
+          <button type="button" id="focusToggle" class="tool-btn" aria-pressed="false" title="Focus mode: hide the panels and read">Focus</button>
+        </div>
         <div class="tool-group" role="group" aria-label="Capture and help">
           <button type="button" id="findToggle" class="tool-btn" title="Find in page (Cmd/Ctrl+F)">Find</button>
           <button type="button" id="pencilToggle" class="tool-btn pencil-tool" aria-pressed="false" title="Draw on the page with a red pencil">Pencil</button>
@@ -49,13 +66,50 @@
         <span><kbd>Cmd/Ctrl</kbd> <kbd>Enter</kbd> Send feedback</span>
         <span><kbd>Cmd/Ctrl</kbd> <kbd>F</kbd> Find in page</span>
         <span><kbd>Cmd/Ctrl</kbd> <kbd>Shift</kbd> <kbd>S</kbd> Capture selected area</span>
-        <span><kbd>Esc</kbd> Cancel capture, finish drawing, or close a comment</span>
+        <span><kbd>Alt</kbd> click Comment on a whole block, or on a heading's whole section</span>
+        <span><kbd>Esc</kbd> Cancel capture, finish drawing, close a comment, or leave focus mode</span>
+      </div>
+      <div id="readerPanel" class="reader-panel" hidden role="dialog" aria-label="Reading settings">
+        <div class="reader-row">
+          <span class="reader-label">Width</span>
+          <div class="segmented" data-setting="width">
+            <button type="button" data-value="narrow">Narrow</button>
+            <button type="button" data-value="medium">Medium</button>
+            <button type="button" data-value="wide">Wide</button>
+            <button type="button" data-value="full">Full</button>
+          </div>
+        </div>
+        <div class="reader-row">
+          <span class="reader-label">Text</span>
+          <div class="segmented" data-setting="size">
+            <button type="button" data-value="s">S</button>
+            <button type="button" data-value="m">M</button>
+            <button type="button" data-value="l">L</button>
+            <button type="button" data-value="xl">XL</button>
+          </div>
+        </div>
+        <div class="reader-row">
+          <span class="reader-label">Font</span>
+          <div class="segmented" data-setting="font">
+            <button type="button" data-value="sans">Sans</button>
+            <button type="button" data-value="serif">Serif</button>
+          </div>
+        </div>
+        <div class="reader-row">
+          <span class="reader-label">Theme</span>
+          <div class="segmented" data-setting="theme">
+            <button type="button" data-value="light">Light</button>
+            <button type="button" data-value="sepia">Sepia</button>
+            <button type="button" data-value="dark">Dark</button>
+          </div>
+        </div>
       </div>
       <iframe
         id="frame"
         title="Artifact under review"
         sandbox="allow-scripts allow-forms allow-modals"></iframe>
       <input id="screenshotFile" type="file" accept="image/png,image/jpeg" hidden>
+      <button type="button" id="focusExit" class="focus-exit" hidden title="Show the panels again"><span id="focusCount"></span>Exit focus <kbd>Esc</kbd></button>
     </main>
 
     <button type="button" id="handle" class="handle" title="Hide comments panel" aria-label="Hide comments panel">›</button>
@@ -84,6 +138,7 @@
             </div>
             <p class="quote" id="composeQuote"></p>
             <textarea id="composeText" rows="3" placeholder="What should change?"></textarea>
+            <div class="presets" id="composePresets" role="group" aria-label="Quick comments"></div>
             <div id="composeScreenshot" class="compose-screenshot" hidden>
               <img id="composeScreenshotImage" alt="Attached screenshot preview">
               <div class="screenshot-meta"><span id="composeScreenshotLabel"></span><button type="button" id="composeScreenshotRemove" class="btn-ghost">Remove</button></div>
@@ -97,7 +152,7 @@
 
         <div id="cards" class="cards"></div>
 
-        <div id="empty" class="empty">Select text or click an element to comment on it</div>
+        <div id="empty" class="empty">Select text to comment on it. For a whole section, use the comment button beside its heading or in Contents. Alt-click comments on one block.</div>
 
         <details id="completedBox" class="completed-history" hidden>
           <summary>Completed <span class="dim" id="completedCount">0</span></summary>

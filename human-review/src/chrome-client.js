@@ -22,6 +22,51 @@ const frame = $("frame");
 const EMPTY_COMPLETED = Object.freeze([]);
 let captureHintDismiss = null;
 
+/**
+ * Quick comments. The text is what the agent receives, so each one reads as
+ * an instruction about the quoted passage. `bubble` ones also appear in the
+ * bar that pops up next to a selection.
+ */
+const PRESETS = Object.freeze([
+  { id: "explain", label: "Explain better", bubble: true, text: "Explain this better: add the missing context or reasoning so a reader new to the topic can follow it." },
+  { id: "clearer", label: "Be clearer", bubble: true, text: "Make this clearer: plainer words, shorter sentences, one idea at a time." },
+  { id: "rephrase", label: "Rephrase", bubble: true, text: "Rephrase this part. Keep the meaning, change the wording." },
+  { id: "grammar", label: "Fix grammar", bubble: true, text: "Fix the grammar, spelling and punctuation here. Change nothing else." },
+  { id: "human-writing", label: "Human writing", bubble: true, text: "Rewrite this with the human-writing skill: strip the AI writing patterns and keep every fact." },
+  { id: "shorten", label: "Shorten", bubble: true, text: "Shorten this. Keep the point and cut the filler." },
+  { id: "genie-one", label: "Ask Genie One", bubble: true, text: "Research, check and validate this point with Genie One on logfood: ask it for the underlying data and compare the answer with what is written. Correct the text where the data differs. If Genie One cannot confirm the point, leave the text as it is and tell me what it could not confirm." },
+  { id: "example", label: "Add an example", text: "Add a concrete example here." },
+  { id: "verify", label: "Check this", text: "Check that this is correct, and say where it comes from." },
+  { id: "remove", label: "Remove", text: "Remove this part." },
+]);
+
+const COMMENT_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7.5L4.5 14v-2.5H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/></svg>';
+const READER_DEFAULTS = Object.freeze({ width: "wide", size: "m", font: "sans", theme: "light" });
+const EMPTY_OUTLINE = Object.freeze({ items: [], active: -1, minutes: 0 });
+
+function loadPref(key, fallback = "") {
+  try {
+    return localStorage.getItem(`human-review:${key}`) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function savePref(key, value) {
+  try {
+    localStorage.setItem(`human-review:${key}`, value);
+  } catch {}
+}
+
+function storedReader() {
+  try {
+    const saved = JSON.parse(loadPref("reader", "{}"));
+    return { ...READER_DEFAULTS, ...(saved && typeof saved === "object" ? saved : {}) };
+  } catch {
+    return { ...READER_DEFAULTS };
+  }
+}
+
 const state = {
   sessionId: document.body.dataset.session,
   token: document.body.dataset.token,
@@ -52,6 +97,12 @@ const state = {
   sending: false,
   commentDraft: null,
   completedSource: undefined,
+  outline: EMPTY_OUTLINE,
+  tocOpen: loadPref("toc", "1") !== "0",
+  reader: storedReader(),
+  readerCapable: false,
+  focus: false,
+  composeOpening: Promise.resolve(),
 };
 
 /**
@@ -123,9 +174,11 @@ function showInFrame(url) {
   frame.src = url;
 }
 
+/** Rendered Markdown arrives already in the reader's settings; other pages ignore them. */
 function artifactUrl(key, bust = false) {
-  const query = bust ? `?t=${Date.now()}` : "";
-  return `${ARTIFACT_ORIGIN}/artifact/${state.artifactToken}/${key}/index.html${query}`;
+  const query = new URLSearchParams(state.reader);
+  if (bust) query.set("t", String(Date.now()));
+  return `${ARTIFACT_ORIGIN}/artifact/${state.artifactToken}/${key}/index.html?${query}`;
 }
 
 /**
@@ -227,6 +280,11 @@ async function loadPage(key, { reload = true } = {}) {
   state.sent = false;
   state.dynamic = false;
   state.baseHash = null;
+  state.outline = EMPTY_OUTLINE;
+  state.readerCapable = false;
+  renderOutline();
+  renderReader();
+  renderProgress(null);
   clearTimeout(retryTimer);
   if (reload) {
     state.reloading = true;
@@ -293,13 +351,14 @@ function render() {
   const edits = page.edits || [];
 
   $("count").textContent = String(comments.length);
+  $("focusCount").textContent = comments.length ? `${comments.length} ${comments.length === 1 ? "comment" : "comments"}` : "";
   $("empty").hidden = comments.length > 0 || !!state.compose;
 
   // --- compose
   const composeWrap = $("compose");
   if (state.compose) {
     composeWrap.hidden = false;
-    $("composeKind").textContent = state.compose.kind === "screenshot" ? "Screenshot" : state.compose.kind === "element" ? "Element" : "Selection";
+    $("composeKind").textContent = { screenshot: "Screenshot", element: "Element", section: "Section" }[state.compose.kind] || "Selection";
     $("composeQuote").textContent = tidy(state.compose.quote, 260);
     renderComposeScreenshot();
   } else {
@@ -386,7 +445,7 @@ function render() {
 
     const quote = document.createElement("p");
     quote.className = "quote";
-    quote.textContent = tidy(comment.quote, 140);
+    quote.textContent = quoteLabel(comment);
 
     const body = document.createElement("p");
     body.className = "body";
@@ -558,6 +617,11 @@ function render() {
   if (stranded) $("handoffCmd").textContent = handoffPrompt(state.pollCommand || page.pollCommand);
 }
 
+/** A section comment names its heading; the rest quote what they cover. */
+function quoteLabel(comment) {
+  return comment.kind === "section" ? `Section: ${tidy(comment.quote, 120)}` : tidy(comment.quote, 140);
+}
+
 /** Completed feedback is passive history. Rebuild it only when page data changes. */
 function renderCompletedComments(completed) {
   const box = $("completedBox");
@@ -583,7 +647,7 @@ function renderCompletedComments(completed) {
     head.append(badge, when);
     const quote = document.createElement("p");
     quote.className = "quote";
-    quote.textContent = tidy(comment.quote, 140);
+    quote.textContent = quoteLabel(comment);
     const body = document.createElement("p");
     body.className = "body";
     body.textContent = comment.feedback;
@@ -594,6 +658,7 @@ function renderCompletedComments(completed) {
 
 function renderToolbar() {
   const edit = state.mode === "edit";
+  document.body.dataset.mode = state.mode;
   $("modeEdit").classList.toggle("active", edit);
   $("modeRead").classList.toggle("active", !edit);
   $("modeEdit").setAttribute("aria-pressed", String(edit));
@@ -666,6 +731,210 @@ function renderSave() {
   if (state.save === "saving") $("saveText").textContent = `Saving to ${name}…`;
   else if (state.save === "failed") $("saveText").textContent = "Couldn't save — retrying…";
   else $("saveText").textContent = state.savedAt ? `Saved to ${name} · ${state.savedAt}` : `Saved to ${name}`;
+}
+
+// ------------------------------------------------------------------ reading
+
+/** Contents: rebuilt only when the page's headings change. */
+function renderOutline() {
+  const { items, minutes } = state.outline;
+  const list = $("tocList");
+  list.textContent = "";
+  const top = items.reduce((level, item) => Math.min(level, item.level), 6);
+  items.forEach((item, index) => {
+    const depth = Math.min(4, Math.max(0, item.level - top));
+    const row = document.createElement("div");
+    row.className = "toc-row";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `toc-item depth-${depth}`;
+    button.style.setProperty("--depth", String(depth));
+    button.textContent = item.text;
+    button.title = item.text;
+    button.addEventListener("click", () => goToHeading(index));
+    const comment = document.createElement("button");
+    comment.type = "button";
+    comment.className = "toc-comment";
+    comment.title = `Comment on the whole section “${item.text}”`;
+    comment.setAttribute("aria-label", comment.title);
+    comment.innerHTML = COMMENT_ICON;
+    comment.addEventListener("click", () => {
+      state.outline = { ...state.outline, active: index };
+      renderOutlineActive();
+      toFrame({ type: "eh:sectionComment", index });
+    });
+    row.append(button, comment);
+    list.append(row);
+  });
+  $("tocMeta").textContent = minutes ? `${minutes} min read` : "";
+  renderOutlineActive();
+  renderToc();
+}
+
+/** Mark the heading being read, and keep it in view inside the panel. */
+function renderOutlineActive() {
+  const list = $("tocList");
+  for (const item of list.querySelectorAll(".toc-item.active")) {
+    item.classList.remove("active");
+    item.removeAttribute("aria-current");
+  }
+  const item = list.children[state.outline.active]?.querySelector(".toc-item");
+  if (!item) return;
+  item.classList.add("active");
+  item.setAttribute("aria-current", "location");
+  // Scrolled by hand: scrollIntoView would also move the overflow-hidden app shell.
+  const top = item.parentElement.offsetTop - list.offsetTop;
+  if (top < list.scrollTop + 8) list.scrollTop = Math.max(0, top - 40);
+  else if (top + item.offsetHeight > list.scrollTop + list.clientHeight - 8) list.scrollTop = top + item.offsetHeight - list.clientHeight + 40;
+}
+
+/** A page with fewer than two headings has nothing to navigate. */
+function renderToc() {
+  const usable = state.outline.items.length >= 2;
+  const open = usable && state.tocOpen;
+  $("toc").hidden = !open;
+  const toggle = $("tocToggle");
+  toggle.disabled = !usable;
+  toggle.classList.toggle("active", open);
+  toggle.setAttribute("aria-pressed", String(open));
+  toggle.title = usable ? (open ? "Hide contents" : "Show contents") : "This page has no headings to list";
+}
+
+function setTocOpen(open) {
+  state.tocOpen = !!open;
+  savePref("toc", state.tocOpen ? "1" : "0");
+  renderToc();
+}
+
+function goToHeading(index) {
+  state.outline = { ...state.outline, active: index };
+  renderOutlineActive();
+  toFrame({ type: "eh:outlineGo", index });
+}
+
+function renderReader() {
+  const toggle = $("readerToggle");
+  toggle.hidden = !state.readerCapable;
+  if (!state.readerCapable) $("readerPanel").hidden = true;
+  toggle.classList.toggle("active", !$("readerPanel").hidden);
+  toggle.setAttribute("aria-expanded", String(!$("readerPanel").hidden));
+  for (const group of document.querySelectorAll("#readerPanel .segmented")) {
+    const value = state.reader[group.dataset.setting];
+    for (const button of group.querySelectorAll("button")) {
+      const on = button.dataset.value === value;
+      button.classList.toggle("active", on);
+      button.setAttribute("aria-pressed", String(on));
+    }
+  }
+}
+
+function setReader(name, value) {
+  state.reader = { ...state.reader, [name]: value };
+  savePref("reader", JSON.stringify(state.reader));
+  toFrame({ type: "eh:reader", settings: state.reader });
+  renderReader();
+  // Dark or Light for the page takes the shell along; Sepia sits with the light shell.
+  if (name === "theme" && (value === "dark") !== shellIsDark()) setTheme(value === "dark");
+}
+
+const shellIsDark = () => document.documentElement.dataset.theme === "dark";
+
+/**
+ * One theme for the whole review: the shell's light/dark switch carries the
+ * page with it, since a dark rail beside a white page reads as broken.
+ * Coming back from dark restores the page's light theme, Sepia included.
+ */
+function setTheme(dark) {
+  applyTheme(dark);
+  savePref("theme", dark ? "dark" : "light");
+  const page = state.reader.theme;
+  if (dark && page !== "dark") {
+    savePref("lightPage", page);
+    setReader("theme", "dark");
+  } else if (!dark && page === "dark") {
+    setReader("theme", loadPref("lightPage", "light") === "sepia" ? "sepia" : "light");
+  }
+}
+
+function renderProgress(progress) {
+  const show = typeof progress === "number" && Number.isFinite(progress);
+  $("progress").hidden = !show;
+  if (show) $("progressBar").style.width = `${Math.round(progress * 1000) / 10}%`;
+}
+
+/** Focus mode leaves only the page; comments still land from the selection bar. */
+function setFocusMode(on) {
+  state.focus = !!on;
+  document.body.classList.toggle("focus-mode", state.focus);
+  $("focusExit").hidden = !state.focus;
+  $("focusToggle").classList.toggle("active", state.focus);
+  $("focusToggle").setAttribute("aria-pressed", String(state.focus));
+  if (state.focus) {
+    $("helpPanel").hidden = true;
+    $("readerPanel").hidden = true;
+    renderReader();
+  }
+}
+
+/** The comments panel is on screen, so the composer can take focus. */
+function railVisible() {
+  return !state.focus && !document.body.classList.contains("collapsed");
+}
+
+function revealRail() {
+  if (state.focus) setFocusMode(false);
+  if (document.body.classList.contains("collapsed")) $("handle").click();
+}
+
+/**
+ * Esc from the shell or from the page: the innermost thing open closes first.
+ * From the page, a comment that already has words in it stays put.
+ */
+function handleEscape({ fromFrame = false } = {}) {
+  if (state.captures.size) {
+    cancelCaptures();
+    return true;
+  }
+  if (state.drawing.active) {
+    stopDrawing();
+    return true;
+  }
+  if (!$("readerPanel").hidden) {
+    $("readerPanel").hidden = true;
+    renderReader();
+    return true;
+  }
+  if (!$("helpPanel").hidden) {
+    $("helpPanel").hidden = true;
+    return true;
+  }
+  if (state.find.open) {
+    closeFind();
+    return true;
+  }
+  if (state.compose && !(fromFrame && $("composeText").value.trim())) {
+    cancelCompose();
+    return true;
+  }
+  if (state.focus) {
+    setFocusMode(false);
+    return true;
+  }
+  return false;
+}
+
+function renderPresetChips() {
+  const box = $("composePresets");
+  box.textContent = "";
+  for (const preset of PRESETS) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "preset";
+    button.textContent = preset.label;
+    button.title = `${preset.text} Anything typed above is added after it.`;
+    button.addEventListener("click", () => commitCompose(preset));
+    box.append(button);
+  }
 }
 
 /** Swap a comment's text for a textarea until the new wording is committed. */
@@ -1011,8 +1280,13 @@ function dismissEmptyScreenshotCompose() {
   render();
 }
 
-/** Opened selection and element comments focus the composer once; ordinary
- * renders still leave an existing draft and caret alone. */
+/**
+ * A comment opened by a deliberate gesture — the selection bar's Comment
+ * button, a block's comment chip, Alt-click — takes focus. So does a
+ * selection in Read mode, where typing has nowhere else to go. In Edit mode
+ * a selection leaves focus in the page: the user may be about to type over
+ * it, and those keystrokes belong to the document.
+ */
 async function openCompose(detail) {
   if (state.compose && $("composeText").value.trim()) await commitCompose();
   if (state.compose?.screenshot) {
@@ -1023,12 +1297,16 @@ async function openCompose(detail) {
   render();
   toFrame({ type: "eh:composeOpen" });
   $("composeText").value = "";
-  if (detail.kind === "selection" || detail.kind === "element") focusComposeInput(detail);
+  if (detail.focus) focusComposeInput(detail);
+  else if (state.mode === "read" && (detail.kind === "selection" || detail.kind === "element")) focusComposeInput(detail, { reveal: false });
 }
 
 /** Focus only for a newly opened comment. Regular renders must never move a
- * user's caret away from an existing draft. */
-function focusComposeInput(compose) {
+ * user's caret away from an existing draft. A hidden composer is revealed,
+ * unless the focus was only a convenience. */
+function focusComposeInput(compose, { reveal = true } = {}) {
+  if (reveal) revealRail();
+  else if (!railVisible()) return;
   requestAnimationFrame(() => {
     if (state.compose !== compose) return;
     const input = $("composeText");
@@ -1045,9 +1323,11 @@ function cancelCompose() {
   render();
 }
 
-async function commitCompose() {
+/** A quick comment files its instruction, followed by anything typed. */
+async function commitCompose(preset = null) {
   const compose = state.compose;
-  const feedback = $("composeText").value.trim();
+  const typed = $("composeText").value.trim();
+  const feedback = preset ? [preset.text, typed].filter(Boolean).join("\n\n") : typed;
   if (!compose || !feedback) return;
   try {
     const payload = { kind: compose.kind, quote: compose.quote, anchor: compose.anchor, feedback };
@@ -1067,7 +1347,7 @@ async function commitCompose() {
     if (state.captures.size) {
       cancelCaptures();
       toast("Comment added without the screenshot, which was not captured yet");
-    }
+    } else if (preset) toast(`Comment added: ${preset.label}`);
     render();
   } catch (err) {
     toast(err.message);
@@ -1135,6 +1415,10 @@ window.addEventListener("message", async (event) => {
       // Drawing exists only in the review overlay. A newly loaded iframe has
       // none of the prior page's canvas or pointer listeners.
       resetDrawing();
+      state.readerCapable = !!msg.reader;
+      if (state.readerCapable) toFrame({ type: "eh:reader", settings: state.reader });
+      renderReader();
+      toFrame({ type: "eh:presets", presets: PRESETS });
       toFrame({ type: "eh:anchors", comments: state.page ? state.page.comments : [] });
       toFrame({ type: "eh:mode", mode: state.mode });
       if (state.find.query) toFrame({ type: "eh:find", query: state.find.query, direction: 0 });
@@ -1187,7 +1471,37 @@ window.addEventListener("message", async (event) => {
       break;
     }
     case "eh:compose":
-      await openCompose({ kind: msg.kind, quote: msg.quote, anchor: msg.anchor });
+      state.composeOpening = openCompose({ kind: msg.kind, quote: msg.quote, anchor: msg.anchor, focus: !!msg.focus });
+      await state.composeOpening;
+      break;
+    case "eh:composeFocus":
+      await state.composeOpening;
+      if (state.compose) focusComposeInput(state.compose);
+      break;
+    case "eh:preset": {
+      // The bar can be clicked before the compose it belongs to has opened.
+      await state.composeOpening;
+      const preset = PRESETS.find((item) => item.id === msg.id);
+      if (preset && state.compose) await commitCompose(preset);
+      break;
+    }
+    case "eh:escape":
+      handleEscape({ fromFrame: true });
+      break;
+    case "eh:outline":
+      state.outline = {
+        items: (Array.isArray(msg.items) ? msg.items : []).map((item) => ({ level: Number(item.level) || 1, text: String(item.text || "") })),
+        active: -1,
+        minutes: Number(msg.minutes) || state.outline.minutes || 0,
+      };
+      renderOutline();
+      break;
+    case "eh:outlineActive":
+      state.outline = { ...state.outline, active: Number(msg.index) };
+      renderOutlineActive();
+      break;
+    case "eh:headingHidden":
+      toast("That heading is hidden in this view");
       break;
     case "eh:dismiss":
       if (!$("composeText").value.trim()) cancelCompose();
@@ -1235,7 +1549,7 @@ window.addEventListener("message", async (event) => {
       dropEditRow(String(msg.label || ""), String(msg.kind || ""));
       break;
     case "eh:undoFailed":
-      toast(msg.kind === "moved" ? "Can't put that one back after a reload — drag it where you want it" : "Can't restore that one after a reload");
+      toast(msg.kind === "moved" ? "Can't put that one back after a reload" : "Can't restore that one after a reload");
       break;
     case "eh:asset":
       try {
@@ -1277,6 +1591,7 @@ window.addEventListener("message", async (event) => {
       break;
     case "eh:scroll":
       state.scroll = { x: msg.x, y: msg.y };
+      renderProgress(msg.progress);
       break;
     case "eh:external": {
       // This side is what actually calls window.open, so it re-checks the
@@ -1313,6 +1628,7 @@ window.addEventListener("message", async (event) => {
 
 function setMode(mode) {
   state.mode = mode === "read" ? "read" : "edit";
+  savePref("mode", state.mode);
   toFrame({ type: "eh:mode", mode: state.mode });
   renderToolbar();
 }
@@ -1363,7 +1679,32 @@ $("findInput").addEventListener("keydown", (event) => {
 });
 $("helpToggle").addEventListener("click", () => {
   $("helpPanel").hidden = !$("helpPanel").hidden;
+  if (!$("helpPanel").hidden) {
+    $("readerPanel").hidden = true;
+    renderReader();
+  }
 });
+$("tocToggle").addEventListener("click", () => {
+  // Focus mode hides the panel; asking for contents there means leaving it.
+  if (state.focus) {
+    setFocusMode(false);
+    setTocOpen(true);
+  } else setTocOpen(!state.tocOpen);
+});
+$("tocClose").addEventListener("click", () => setTocOpen(false));
+$("readerToggle").addEventListener("click", () => {
+  $("readerPanel").hidden = !$("readerPanel").hidden;
+  if (!$("readerPanel").hidden) $("helpPanel").hidden = true;
+  renderReader();
+});
+for (const group of document.querySelectorAll("#readerPanel .segmented")) {
+  group.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-value]");
+    if (button) setReader(group.dataset.setting, button.dataset.value);
+  });
+}
+$("focusToggle").addEventListener("click", () => setFocusMode(!state.focus));
+$("focusExit").addEventListener("click", () => setFocusMode(false));
 $("pencilToggle").addEventListener("click", () => toFrame({ type: "eh:draw", action: "toggle" }));
 $("drawingUndo").addEventListener("click", () => toFrame({ type: "eh:draw", action: "undo" }));
 $("drawingClear").addEventListener("click", () => toFrame({ type: "eh:draw", action: "clear" }));
@@ -1378,7 +1719,7 @@ $("screenshotFile").addEventListener("change", async (event) => {
 });
 $("composeScreenshotRemove").addEventListener("click", clearComposeScreenshot);
 
-$("composeAdd").addEventListener("click", commitCompose);
+$("composeAdd").addEventListener("click", () => commitCompose());
 $("composeCancel").addEventListener("click", cancelCompose);
 
 // Clicking anywhere on the card is the "I meant to comment" gesture.
@@ -1566,13 +1907,7 @@ $("handle").addEventListener("click", () => {
   } catch {}
 });
 
-$("theme").addEventListener("click", () => {
-  const dark = document.documentElement.dataset.theme !== "dark";
-  applyTheme(dark);
-  try {
-    localStorage.setItem("human-review:theme", dark ? "dark" : "light");
-  } catch {}
-});
+$("theme").addEventListener("click", () => setTheme(!shellIsDark()));
 
 function applyTheme(dark) {
   document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -1608,21 +1943,8 @@ document.addEventListener("keydown", (event) => {
     renderSave();
     return;
   }
-  if (event.key === "Escape" && state.captures.size) {
-    event.preventDefault();
-    cancelCaptures();
-    return;
-  }
-  if (event.key === "Escape" && state.drawing.active) {
-    event.preventDefault();
-    stopDrawing();
-    return;
-  }
-  if (event.key === "Escape" && state.find.open) {
-    closeFind();
-    return;
-  }
-  if (event.key === "Escape" && state.compose) cancelCompose();
+  // The find box and the composer handle their own Esc first.
+  if (event.key === "Escape" && !event.defaultPrevented && handleEscape()) event.preventDefault();
 });
 
 // ------------------------------------------------------------------ events
@@ -1687,8 +2009,16 @@ function connect() {
 (async function start() {
   try {
     applyTheme(localStorage.getItem("human-review:theme") === "dark");
+    // Settings saved before the two themes were joined may disagree; the shell wins.
+    if ((state.reader.theme === "dark") !== shellIsDark()) {
+      state.reader = { ...state.reader, theme: shellIsDark() ? "dark" : "light" };
+      savePref("reader", JSON.stringify(state.reader));
+    }
     if (localStorage.getItem("human-review:collapsed") === "1") $("handle").click();
   } catch {}
+  state.mode = loadPref("mode", "edit") === "read" ? "read" : "edit";
+  renderPresetChips();
+  renderToolbar();
 
   const bootstrap = await api(`/api/session/${state.sessionId}/page`).catch(() => null);
   if (!bootstrap) {

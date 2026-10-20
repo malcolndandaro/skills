@@ -79,3 +79,28 @@ test("whitespace-tolerant matching still disambiguates repeats", () => {
   assert.ok(hit);
   assert.ok(after.slice(0, hit.start).includes("gamma"), "context picks the second occurrence");
 });
+
+test("trimSpan keeps a selection on its words", async () => {
+  const { trimSpan } = await import("../src/anchor-text.js");
+  const text = "\n  Only this sentence.\n\n Next";
+  assert.deepEqual(trimSpan(text, 0, 23), { start: 3, end: 22 });
+  assert.equal(trimSpan(text, 0, 3), null, "a span of whitespace is no selection");
+  assert.deepEqual(trimSpan("abc", -4, 99), { start: 0, end: 3 });
+});
+
+test("buildAnchor keeps short quotes whole and long ones by their ends", async () => {
+  const { buildAnchor, findSpan, LONG_PART } = await import("../src/anchor-text.js");
+  const short = buildAnchor("one two three", 4, 7);
+  assert.equal(short.quote, "two");
+  assert.equal(short.long, undefined);
+  assert.deepEqual(findSpan("one two three", short), { start: 4, end: 7, exact: true });
+
+  const body = "x".repeat(5000);
+  const text = `before ${body} after`;
+  const anchor = buildAnchor(text, 7, 7 + body.length);
+  assert.equal(anchor.long, true);
+  assert.equal(anchor.quote.length, LONG_PART);
+  assert.equal(anchor.end.length, LONG_PART);
+  const hit = findSpan(`new words ${text}`, anchor);
+  assert.equal(hit.end - hit.start, body.length, "an edit before the passage only shifts it");
+});

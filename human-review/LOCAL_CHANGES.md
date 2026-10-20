@@ -4,7 +4,7 @@ This skill extends [Peter Yang's Human Review](https://github.com/petergyang/hum
 v0.8.2 from the original `malcoln/review-improvements` branch. Peter Yang's original
 MIT license and copyright are preserved in `LICENSE`.
 The canonical source is now the `human-review/` folder in the personal skills repo.
-The local package version is `0.8.2-malcoln.4`.
+The local package version is `0.8.2-malcoln.5`.
 
 Install dependencies with `npm ci`, then run `node scripts/install-local.mjs`.
 The installer writes `~/.local/bin/human-review` pointing to this folder and links
@@ -155,3 +155,96 @@ Regression coverage passes 163 tests, including a renderer that never settles.
 Chromium verified Add comment during a pending selection (Send freed, toast
 shown), a normal region capture still attaching, and Esc with a typed draft.
 A review tab stuck on the old client recovers with a reload; its comments stay.
+
+## Reading, contents and selection
+
+Version `0.8.2-malcoln.5` uses protocol 14, so an older server is replaced on
+the next open: the Markdown renderer runs inside the server process.
+
+Selecting text sometimes produced a comment on the whole block. The SDK only
+accepted ranges whose ends were inside text nodes; a triple-click (which ends
+at the start of the next paragraph) or a drag past the line end ends on an
+element, so the selection was dropped and the click fell through to a block
+comment. Range ends now map to text offsets wherever they fall, and the span
+is trimmed to its words. Plain clicks no longer open block comments or move
+focus into the comment field, which had sent typing into the comment instead
+of the document. Block comments take Alt-click or the block's comment chip;
+images, diagrams and authored `data-container` blocks still open on click.
+The pending selection is painted with the CSS Highlight API, so it stays
+visible once focus moves to the rail, and is never written into the DOM.
+
+A bar beside a selection offers Comment plus five quick comments; the compose
+card lists eight. Their text is a fixed instruction for the agent, followed by
+anything typed. A Contents panel lists the page's headings, highlights the one
+being read and scrolls to a heading on click. A thin bar shows reading progress.
+
+Rendered Markdown dropped its 72ch column for a 68rem default and declares
+narrow, medium, wide and full widths, four text sizes, sans or serif, and
+light, sepia or dark themes as `data-eh-*` attributes on `<html>`. The SDK
+flips them only on pages carrying `<meta name="human-review-reader">`, so
+HTML artifacts keep their own styling. Tables scroll instead of squeezing.
+Focus mode hides both panels; Esc from the page now reaches the chrome.
+Read mode hides the formatting tools, the toolbar adapts to the stage width
+with container queries, and the mode, contents and reading settings persist.
+
+Regression coverage passes 174 tests. Chromium verified on a 33-heading
+Markdown fixture: a triple-click and a drag into the right margin each opened
+a Selection with the exact sentence; Be clearer from the bar filed its comment
+and marked that sentence; a plain click left focus in the page and typed text
+became a document edit; Alt-click opened a focused Element comment; a Contents
+click put its heading at 64 px below the frame top with the item active;
+sepia/serif/medium and dark rendered and persisted across reload; Esc inside
+the page left Focus mode. An HTML fixture listed its headings, hid Aa, gained
+no attributes and stayed byte-identical after a quick comment. Screenshots:
+`output/reading-smoke/`.
+
+### Section comments and long selections
+
+There was no way to comment on a heading and everything under it. Alt-click
+covered one paragraph, and dragging across a section usually passed the 4,000
+character quote limit, so Add comment failed. A new `section` comment covers a
+heading through the next heading of the same or a higher level. It opens from
+the comment chip on a heading, Alt-click on a heading, or the comment button on
+each Contents entry. It stores only the heading text, level and path, so its
+size does not depend on the section's. The heading's words carry the mark, and
+activating the comment paints the whole section with the Highlight API.
+After a reload it finds the heading again by path, or by text and level.
+
+Selections longer than 3,600 characters now keep their first and last 1,600
+characters (`anchor.quote`, `anchor.end`, `anchor.long`) and quote both joined
+by `[…]`. They are found again from both ends. The server bounds the new
+anchor fields with the existing limit and accepts `kind: "section"`.
+
+Regression coverage passes 178 tests. Chromium verified that the chip on
+"Plano de execução" (H2) took the H3s and H4 below it and stopped before the
+next H2. The Contents button on the H1 took the whole document, and Human
+writing filed against it. A click plus Shift+click across 3,976 characters
+was stored as a 3,205-character long anchor. After a reload all three comments
+re-anchored with no Text changed badge, and Jump to on the section card painted
+the section. Screenshots: `output/reading-smoke/07-*` to `10-*`.
+
+### Block mover removed, one theme, more quick comments
+
+The drag handle on each block's left edge is gone, with its drop line and
+auto-scroll. It sat over the first letters of list items and competed with
+selection. The server still accepts `moved` edits, so feedback stored by an
+earlier review still delivers; new reviews no longer produce them. Image drag
+and resize are unchanged.
+
+The shell's light/dark switch and the page theme were separate, so a dark rail
+sat beside a white page. The switch now carries the page with it, and picking
+Dark or Light in Aa carries the shell. Sepia stays with the light shell and
+comes back after dark. Reading settings travel in the artifact URL, and the
+server renders Markdown with them (`src/reader.js`, shared with the SDK), so a
+reload in dark mode never paints white first. On a dark page the selection bar
+inverts to stay visible.
+
+Quick comments gain Fix grammar and Ask Genie One. The latter asks the agent to
+check the passage against Genie One on logfood, correct it where the data
+differs, and report what Genie One could not confirm outside the page.
+
+Regression coverage passes 179 tests. Chromium verified no move handle on
+hover; sepia, then the moon switch, gave a dark page (rgb 28, 27, 24) and the
+sun switch restored sepia; the served HTML after a dark reload already carried
+`data-eh-theme="dark"`; the bar showed all eight buttons on one line, inverted
+on dark; Ask Genie One filed its instruction. Screenshots: `11-*`, `12-*`.

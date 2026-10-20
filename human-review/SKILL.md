@@ -188,6 +188,21 @@ One batch covers every page the user visited, grouped by file or localhost URL.
   tags; `anchor.prefix` and `anchor.suffix` give the surrounding text to
   disambiguate.
 - `kind: "element"` points at a whole block, so `quote` is its label, not body text.
+- `kind: "section"` covers a heading and everything under it, up to the next
+  heading of the same or a higher level. `quote` and `anchor.heading` hold the
+  heading's text and `anchor.level` its level (1 for `#`, 2 for `##`). Find
+  that heading in the source and apply the feedback to the whole section.
+- A selection with `anchor.long: true` is a long passage. `quote` holds its
+  opening and closing words joined by ` […] `; `anchor.quote` is the exact
+  start and `anchor.end` the exact end. It covers everything in between.
+- Some feedback comes from quick-comment buttons and reads as a fixed
+  instruction ("Make this clearer: …", "Rephrase this part. …"), sometimes
+  followed by the user's own words. Apply it to the quoted passage only. When
+  it names the human-writing skill, load that skill and rewrite the passage
+  with it, keeping every fact. When it asks for Genie One, query Genie One on
+  the logfood workspace before changing anything, base the change on what it
+  returns, and tell the user in your own message (not in the page) what it
+  could not confirm.
 - Copy any `staged_assets` files before you ack: `--ack` deletes them.
 - A batch with only an `overall_note` has an empty `pages` array.
 - Fix every page in `pages`, not just the first.
@@ -218,10 +233,25 @@ them again, and does not keep temporary screenshot files.
 The toolbar provides Edit and Read modes, bold, italic, underline, strikeout,
 lists, undo and redo. Select text or place the cursor before using formatting.
 Find searches the rendered document; Enter and Shift+Enter cycle matches.
-When the user releases a text or element selection, the comment field receives
-focus so they can type immediately. Toolbar formatting restores the document
-selection when used.
+Selecting text opens a comment on exactly those words and shows a bar beside
+them with Comment and quick comments (Explain better, Be clearer, Rephrase,
+Fix grammar, Human writing, Shorten, Ask Genie One); the comment card offers a
+few more. A plain click
+only places the caret. A whole-block comment takes Alt-click or the block's
+comment button; images and diagrams open one on click. On a heading, the
+comment button and Alt-click cover its whole section, and each Contents entry
+has the same button. Click at the start and Shift+click at the end to select
+any longer passage. In Read mode a
+selection focuses the comment field; in Edit mode focus stays in the page,
+so typing over the selection edits it. Toolbar formatting restores the
+document selection when used.
 Cmd/Ctrl+Enter sends feedback; Cmd/Ctrl+Shift+S starts an area capture.
+
+Contents lists the page's headings in a side panel, follows the reading
+position and scrolls to a heading on click. Rendered Markdown fills a wide
+column by default; Aa sets its width, text size, font and theme, which are
+remembered between reviews. Focus hides both panels, keeps the selection bar
+for quick comments, and Esc leaves it. These settings never touch the source.
 
 Click Pencil to draw red strokes on the page, or click once to leave a red dot.
 Undo drawing removes the last stroke; Clear drawing removes all marks.

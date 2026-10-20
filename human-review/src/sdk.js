@@ -5,12 +5,13 @@
  * document: editing, highlights, target resolution and serialization. It never
  * talks to the server — everything crosses to the chrome page by postMessage.
  */
-import { buildContext, findQuote } from "./anchor-text.js";
+import { buildAnchor, buildContext, findQuote, findSpan, LONG_PART, LONG_SELECTION, trimSpan } from "./anchor-text.js";
 import { hashClickAction, inPageControl, navigationHref } from "./click-target.js";
 import { linkStyleFixup, listCommandFor, listStyleFixup, normalizeHref } from "./editing.js";
 import { keepBodyEditable, serializeDocument, UI_ATTR, MARK_ATTR } from "./serialize.js";
 import { capturePage } from "./screenshot.js";
 import { createAnnotations } from "./annotations.js";
+import { readerSettings } from "./reader.js";
 
 // A hot reload may inject the SDK twice without replacing the document.
 // Release the previous instance before installing another set of handlers.
@@ -25,6 +26,7 @@ let editableObserver = null;
 let renderingObserver = null;
 let renderingTimer = null;
 let selectionRange = null;
+let outlineObserver = null;
 
 const timers = new Set();
 const animationFrames = new Set();
@@ -65,7 +67,10 @@ function dispose() {
   cancelLater(renderingTimer);
   editableObserver?.disconnect();
   renderingObserver?.disconnect();
-  editableObserver = renderingObserver = null;
+  outlineObserver?.disconnect();
+  editableObserver = renderingObserver = outlineObserver = null;
+  for (const name of [PENDING_HIGHLIGHT, SECTION_HIGHLIGHT, FLASH_HIGHLIGHT]) clearHighlight(name);
+  sectionHeadings.clear();
   baseline = bootSnapshot = null;
   for (const timer of timers) clearTimeout(timer);
   timers.clear();
@@ -73,7 +78,9 @@ function dispose() {
   animationFrames.clear();
   for (const cleanup of disposers.splice(0)) cleanup();
   editQueue.clear();
-  selectionRange = pending = hoverTarget = hoverMove = hoverMedia = resizing = null;
+  selectionRange = pending = hoverTarget = hoverMedia = resizing = null;
+  bubbleRange = bubbleEl = activeBoxEl = null;
+  outline = [];
   host.remove();
   document.querySelectorAll("style[data-eh-sdk]").forEach((el) => el.remove());
   document.body?.removeAttribute("contenteditable");
@@ -103,12 +110,15 @@ const post = (type, payload) => {
 
 let pending = null; // { id, marks } for an uncommitted highlight
 let hoverTarget = null;
-let hoverMove = null; // the innermost block under the cursor, movable via the handle
 let hoverMedia = null; // the img/video under the cursor, resizable via the grip
 let resizing = null; // live drag state while the grip is held
 let suppressUntil = 0; // ignore the mouseup/click that ends a resize drag
 let saveTimer = null;
 let composeOpen = false;
+let bubbleRange = null; // the live range a selection comment is about, while its bubble shows
+let bubbleEl = null; // the block a block comment is about, while its bubble shows
+let activeBoxEl = null; // what the dark outline marks: a pending block or the active comment
+let presets = []; // quick comments, as the chrome defines them: { id, label, text, bubble }
 /** True when the page's own scripts rewrote the DOM before any user edit. */
 let dynamic = false;
 
@@ -137,8 +147,8 @@ shadow.innerHTML = `
     .chip:hover { background: #1b1a16; color: #fff; border-color: #1b1a16; }
     .chip.danger { color: #b23b2e; }
     .chip.danger:hover { background: #b23b2e; color: #fff; border-color: #b23b2e; }
-    .chips .chip, .mover { opacity: .6; transition: opacity 100ms ease; }
-    .chips .chip:hover, .chips .chip:focus-visible, .mover:hover, .mover:focus-visible { opacity: 1; }
+    .chips .chip { opacity: .6; transition: opacity 100ms ease; }
+    .chips .chip:hover, .chips .chip:focus-visible { opacity: 1; }
     .grip {
       position: fixed; z-index: 2147483647; width: 13px; height: 13px;
       display: none; border: 1px solid #1b1a16; border-radius: 3px;
@@ -161,41 +171,37 @@ shadow.innerHTML = `
       font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1b1a16;
     }
     .linkbox input::placeholder { color: #a29f95; }
-    .mover {
-      position: fixed; z-index: 2147483647; width: 18px; height: 24px;
-      display: none; align-items: center; justify-content: center;
-      border: 1px solid #e4e2db; border-radius: 6px; background: #fff; color: #a29f95;
+    .chip svg { width: 12px; height: 12px; }
+    .bubble {
+      position: fixed; z-index: 2147483647; display: none; flex-wrap: wrap; align-items: center; gap: 2px;
+      max-width: min(780px, calc(100vw - 16px)); padding: 4px; border-radius: 9px;
+      background: #1b1a16; color: #fbfaf7; pointer-events: auto; user-select: none;
+      box-shadow: 0 6px 22px rgba(27,26,22,.28);
       font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      cursor: grab; pointer-events: auto; user-select: none;
-      box-shadow: 0 2px 8px rgba(27,26,22,.14);
     }
-    .mover:hover { color: #1b1a16; border-color: #c2beb4; }
-    .mover:active { cursor: grabbing; }
-    .dropline {
-      position: fixed; z-index: 2147483646; height: 3px; display: none;
-      background: #1f6feb; border-radius: 2px; pointer-events: none;
-      box-shadow: 0 0 0 2px rgba(255,255,255,.9);
+    .bubble button {
+      padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: inherit;
+      font: inherit; white-space: nowrap; cursor: pointer;
     }
-    .dropline::before, .dropline::after {
-      content: ""; position: absolute; top: -3px; width: 9px; height: 9px;
-      border-radius: 50%; background: #1f6feb; box-shadow: 0 0 0 2px rgba(255,255,255,.9);
-    }
-    .dropline::before { left: -4px; }
-    .dropline::after { right: -4px; }
-    .dropTarget { border: 1px dashed #1f6feb; background: rgba(31,111,235,.05); }
-    .dragLabel {
-      position: fixed; z-index: 2147483647; display: none; max-width: 360px; padding: 4px 9px;
-      border-radius: 6px; background: #1b1a16; color: #fbfaf7; white-space: nowrap;
-      overflow: hidden; text-overflow: ellipsis; pointer-events: none;
-      font: 11.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      box-shadow: 0 4px 14px rgba(27,26,22,.22);
-    }
-    .dragLabel b { color: #9cc2ff; font-weight: 600; }
+    .bubble button:hover, .bubble button:focus-visible { background: rgba(255,255,255,.15); outline: none; }
+    .bubble .primary { font-weight: 600; }
+    .bubble .sep { width: 1px; align-self: stretch; margin: 3px 2px; background: rgba(255,255,255,.2); }
+    .bubble .presets { display: contents; }
+    /* On a dark page the dark bar would vanish; invert it. */
+    :host([data-eh-dark]) .bubble, :host([data-eh-dark]) .hint { background: #f4f1ea; color: #1b1a16; box-shadow: 0 6px 22px rgba(0,0,0,.5); }
+    :host([data-eh-dark]) .bubble button:hover, :host([data-eh-dark]) .bubble button:focus-visible { background: rgba(27,26,22,.1); }
+    :host([data-eh-dark]) .bubble .sep { background: rgba(27,26,22,.2); }
   </style>
   <div class="box outline" id="outline"></div>
   <div class="box active" id="activeBox"></div>
   <div class="chips" id="chips">
+    <button class="chip" id="chipComment" title="Comment on this whole block" aria-label="Comment on this whole block"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H7.5L4.5 14v-2.5H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/></svg></button>
     <button class="chip danger" id="chipDelete" title="Delete this block" aria-label="Delete this block">&#10005;</button>
+  </div>
+  <div class="bubble" id="bubble" role="toolbar" aria-label="Comment on this">
+    <button type="button" class="primary" id="bubbleComment" title="Write a comment">Comment</button>
+    <span class="sep" id="bubbleSep"></span>
+    <span class="presets" id="bubblePresets"></span>
   </div>
   <div class="grip" id="grip" title="Drag to resize"></div>
   <div class="hint" id="hint"></div>
@@ -204,10 +210,6 @@ shadow.innerHTML = `
     <button class="chip" id="linkApply" title="Apply link (&#9166;)" aria-label="Apply link">&#8629;</button>
     <button class="chip danger" id="linkRemove" title="Remove link" aria-label="Remove link">&#10005;</button>
   </div>
-  <div class="mover" id="mover" title="Drag to move this block">&#10303;</div>
-  <div class="box dropTarget" id="dropTarget"></div>
-  <div class="dropline" id="dropline"></div>
-  <div class="dragLabel" id="dragLabel"></div>
 `;
 
 const els = {};
@@ -217,66 +219,18 @@ const mountOverlay = () => {
   els.activeBox = shadow.getElementById("activeBox");
   els.chips = shadow.getElementById("chips");
   els.chipDelete = shadow.getElementById("chipDelete");
+  els.chipComment = shadow.getElementById("chipComment");
+  els.bubble = shadow.getElementById("bubble");
+  els.bubbleComment = shadow.getElementById("bubbleComment");
+  els.bubbleSep = shadow.getElementById("bubbleSep");
+  els.bubblePresets = shadow.getElementById("bubblePresets");
   els.grip = shadow.getElementById("grip");
   els.hint = shadow.getElementById("hint");
   els.linkbox = shadow.getElementById("linkbox");
   els.linkInput = shadow.getElementById("linkInput");
   els.linkApply = shadow.getElementById("linkApply");
   els.linkRemove = shadow.getElementById("linkRemove");
-  els.mover = shadow.getElementById("mover");
-  els.dropline = shadow.getElementById("dropline");
-  els.dropTarget = shadow.getElementById("dropTarget");
-  els.dragLabel = shadow.getElementById("dragLabel");
 };
-
-function showMover(el) {
-  if (!editMode) el = null;
-  if (!el || !el.isConnected) {
-    els.mover.style.display = "none";
-    return;
-  }
-  const r = el.getBoundingClientRect();
-  if (!r.width && !r.height) {
-    els.mover.style.display = "none";
-    return;
-  }
-  els.mover.style.display = "flex";
-  // Half-overlap the block's edge: the pointer can travel from text to handle
-  // without ever leaving the block, so the hover state never drops.
-  els.mover.style.left = `${Math.max(4, r.left - 9)}px`;
-  els.mover.style.top = `${Math.max(4, r.top + 1)}px`;
-}
-
-/**
- * Where a dragged block will land: a bold line on the edge it drops against,
- * a dashed outline on the block that edge belongs to, and a label by the
- * pointer saying the same in words. Three cues, because a thin line alone
- * vanishes against borders and bullets.
- */
-function showDropline(drop, pointer, movingLabel) {
-  if (!drop || !drop.ref.isConnected) {
-    els.dropline.style.display = "none";
-    els.dropTarget.style.display = "none";
-    els.dragLabel.style.display = "none";
-    return;
-  }
-  const r = drop.ref.getBoundingClientRect();
-  els.dropline.style.display = "block";
-  els.dropline.style.left = `${r.left}px`;
-  els.dropline.style.width = `${r.width}px`;
-  els.dropline.style.top = `${(drop.before ? r.top : r.bottom) - 2}px`;
-  place(els.dropTarget, drop.ref, 3);
-  if (!pointer) return;
-  els.dragLabel.textContent = "";
-  const verb = document.createTextNode(`Move “${clip(movingLabel, 28)}” ${drop.before ? "above" : "below"} `);
-  const target = document.createElement("b");
-  target.textContent = `“${clip(drop.ref.textContent, 32)}”`;
-  els.dragLabel.append(verb, target);
-  els.dragLabel.style.display = "block";
-  const below = pointer.y + 44 < window.innerHeight;
-  els.dragLabel.style.left = `${Math.max(8, Math.min(pointer.x + 14, window.innerWidth - 372))}px`;
-  els.dragLabel.style.top = `${below ? pointer.y + 18 : pointer.y - 34}px`;
-}
 
 function place(box, el, pad = 2) {
   if (!el || !el.isConnected) {
@@ -295,12 +249,17 @@ function place(box, el, pad = 2) {
   box.style.height = `${r.height + pad * 2}px`;
 }
 
+/** Block chips: comment in both modes, delete only while editing. */
 function showChip(el) {
-  if (!editMode) el = null;
   if (!el || !el.isConnected) {
     els.chips.style.display = "none";
     return;
   }
+  els.chipDelete.style.display = editMode ? "" : "none";
+  // On a heading the chip comments on everything under it, not just the title.
+  const label = isHeading(el) ? "Comment on this whole section" : "Comment on this whole block";
+  els.chipComment.title = label;
+  els.chipComment.setAttribute("aria-label", label);
   const r = el.getBoundingClientRect();
   // A target in a collapsed tab has no box; don't strand the chips in a corner.
   if (!r.width && !r.height) {
@@ -339,6 +298,75 @@ function showHint(text, x, y) {
   els.hint.style.top = `${y + 16}px`;
 }
 
+// The review toolbar floats over the top of the page; nothing of ours may hide under it.
+const TOOLBAR_GUARD = 56;
+
+function renderPresets() {
+  els.bubblePresets.textContent = "";
+  const shown = presets.filter((preset) => preset.bubble);
+  for (const preset of shown) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.preset = preset.id;
+    button.textContent = preset.label;
+    button.title = preset.text;
+    els.bubblePresets.append(button);
+  }
+  els.bubbleSep.style.display = shown.length ? "" : "none";
+}
+
+/**
+ * The bubble sits next to what is being commented on: above a selection's
+ * first line, or below its last when the toolbar is in the way. It follows
+ * scrolling and hides while its anchor is out of view.
+ */
+function showBubble() {
+  const hide = () => {
+    els.bubble.style.display = "none";
+  };
+  if (bubbleEl && !bubbleEl.isConnected) bubbleEl = null;
+  if (!bubbleRange && !bubbleEl) return hide();
+  const box = bubbleRange ? bubbleRange.getBoundingClientRect() : bubbleEl.getBoundingClientRect();
+  if ((!box.width && !box.height) || box.bottom < 0 || box.top > window.innerHeight) return hide();
+  const lines = bubbleRange ? [...bubbleRange.getClientRects()].filter((r) => r.width || r.height) : [];
+  const first = lines[0] || box;
+  const last = lines[lines.length - 1] || box;
+  els.bubble.style.display = "flex";
+  const width = els.bubble.offsetWidth;
+  const height = els.bubble.offsetHeight;
+  let top = first.top - height - 8;
+  if (top < TOOLBAR_GUARD) top = Math.min((bubbleRange ? last.bottom : first.top) + 8, window.innerHeight - height - 8);
+  els.bubble.style.top = `${Math.max(TOOLBAR_GUARD, top)}px`;
+  els.bubble.style.left = `${Math.max(8, Math.min(first.left, window.innerWidth - width - 8))}px`;
+  return undefined;
+}
+
+function hideBubble() {
+  bubbleRange = bubbleEl = null;
+  els.bubble.style.display = "none";
+}
+
+// Highlights paint ranges without touching the DOM, so they never reach
+// serialization, edit rows, or the self-rendering check.
+const PENDING_HIGHLIGHT = "eh-pending";
+const SECTION_HIGHLIGHT = "eh-section";
+const FLASH_HIGHLIGHT = "eh-flash";
+
+function setHighlight(name, range) {
+  try {
+    if (range && window.Highlight && CSS.highlights) CSS.highlights.set(name, new window.Highlight(range));
+    else clearHighlight(name);
+  } catch {
+    // Browsers without the Highlight API simply show no pending mark.
+  }
+}
+
+function clearHighlight(name) {
+  try {
+    CSS.highlights?.delete(name);
+  } catch {}
+}
+
 // ------------------------------------------------------------ text plumbing
 
 const isOurs = (node) => {
@@ -370,15 +398,98 @@ function flatten() {
   return { text, map };
 }
 
-function offsetsFromRange(map, range) {
-  let start = null;
-  let end = null;
-  for (const entry of map) {
-    if (entry.node === range.startContainer) start = entry.start + range.startOffset;
-    if (entry.node === range.endContainer) end = entry.start + range.endOffset;
+/**
+ * The flattened-text offset of a range boundary. Inside a text node it maps
+ * directly. Between nodes — a triple-click ends at the start of the next
+ * paragraph, a drag past the line end stops on the block itself — it maps to
+ * the first text node after the point. Those selections used to be rejected,
+ * and the click then fell through to a comment on the whole block.
+ */
+function pointOffset(map, container, offset) {
+  if (container.nodeType === 3) {
+    const entry = map.find((item) => item.node === container);
+    if (entry) return entry.start + Math.min(offset, entry.end - entry.start);
   }
-  if (start === null || end === null || end <= start) return null;
-  return { start, end };
+  const probe = document.createRange();
+  try {
+    probe.setStart(container, offset);
+  } catch {
+    return null;
+  }
+  // The map is in document order, so the first text node at or after the
+  // point is a binary search away.
+  let lo = 0;
+  let hi = map.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (probe.comparePoint(map[mid].node, 0) < 0) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo < map.length) return map[lo].start;
+  return map.length ? map[map.length - 1].end : 0;
+}
+
+// ---------------------------------------------------------------- sections
+
+const HEADINGS = "h1, h2, h3, h4, h5, h6";
+const isHeading = (el) => !!(el && el.nodeType === 1 && /^h[1-6]$/i.test(el.tagName));
+const headingLevel = (el) => Number(el.tagName[1]);
+const pageHeadings = () => [...document.body.querySelectorAll(HEADINGS)].filter((el) => !isOurs(el));
+
+/** Section comments by id, so activating one can paint all it covers. */
+const sectionHeadings = new Map();
+
+/** A heading and everything after it, up to the next heading of the same or a higher level. */
+function sectionRange(heading) {
+  const level = headingLevel(heading);
+  const all = pageHeadings();
+  const next = all.slice(all.indexOf(heading) + 1).find((el) => headingLevel(el) <= level);
+  const range = document.createRange();
+  range.setStartBefore(heading);
+  if (next) range.setEndBefore(next);
+  else range.setEnd(document.body, document.body.childNodes.length);
+  return range;
+}
+
+/** The heading a section comment names, even after the page reloaded or moved it. */
+function findHeading(anchor) {
+  if (!anchor || !anchor.heading) return null;
+  const same = (el) => clip(el.textContent, 200) === anchor.heading;
+  let byPath = null;
+  try {
+    byPath = anchor.selector ? document.querySelector(anchor.selector) : null;
+  } catch {}
+  if (isHeading(byPath) && same(byPath)) return byPath;
+  const matches = pageHeadings().filter(same);
+  return matches.find((el) => headingLevel(el) === Number(anchor.level)) || matches[0] || null;
+}
+
+/** Mark a heading's own words, the visible handle of a section comment. */
+function wrapElementText(el, id) {
+  const { text, map } = flatten();
+  const inside = map.filter((entry) => el.contains(entry.node));
+  if (!inside.length) return [];
+  const span = trimSpan(text, inside[0].start, inside[inside.length - 1].end);
+  return span ? wrapOffsets(map, span.start, span.end, id) : [];
+}
+
+/** A live range over a flattened-text span, for highlighting and placement. */
+function rangeFromOffsets(map, start, end) {
+  const first = map.find((entry) => entry.end > start);
+  let last = null;
+  for (const entry of map) {
+    if (entry.start >= end) break;
+    last = entry;
+  }
+  if (!first || !last) return null;
+  const range = document.createRange();
+  try {
+    range.setStart(first.node, Math.max(0, start - first.start));
+    range.setEnd(last.node, Math.min(last.node.nodeValue.length, end - last.start));
+  } catch {
+    return null;
+  }
+  return range;
 }
 
 /** Wrap a global offset span in <mark> elements, one per text node touched. */
@@ -714,60 +825,133 @@ function queueEdit(payload) {
 
 // ------------------------------------------------------------- interactions
 
+function markActive(el) {
+  activeBoxEl = el && el.isConnected ? el : null;
+  place(els.activeBox, activeBoxEl);
+}
+
 function clearPending() {
+  if (pending && pending.kind === "section") clearHighlight(SECTION_HIGHLIGHT);
   pending = null;
-  place(els.activeBox, null);
+  markActive(null);
+  setHighlight(PENDING_HIGHLIGHT, null);
+  hideBubble();
 }
 
 /**
  * A settled selection opens the compose card but is otherwise left completely
  * alone: still selected, still editable. Nothing is written into the document
  * until the comment is actually committed, so typing or Backspace behaves
- * exactly as it would in any editable page.
+ * exactly as it would in any editable page. The pending span is painted as a
+ * highlight instead, so it stays visible once focus moves to the comment field.
  */
 function settleSelection() {
   const sel = document.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
   const range = sel.getRangeAt(0);
-  if (!document.body.contains(range.commonAncestorContainer)) return false;
-  if (isOurs(range.commonAncestorContainer)) return false;
-  const quote = sel.toString();
-  if (!quote.trim()) return false;
+  const common = range.commonAncestorContainer;
+  if (!document.body.contains(common) || isOurs(common)) return false;
 
   const { text, map } = flatten();
-  const offsets = offsetsFromRange(map, range);
-  if (!offsets) return false;
+  const start = pointOffset(map, range.startContainer, range.startOffset);
+  const end = pointOffset(map, range.endContainer, range.endOffset);
+  const span = start === null || end === null ? null : trimSpan(text, start, end);
+  if (!span) return false;
 
-  const context = buildContext(text, offsets.start, offsets.end);
-  pending = { kind: "selection", context };
+  const context = buildContext(text, span.start, span.end);
+  if (pending && pending.kind === "section") clearHighlight(SECTION_HIGHLIGHT);
+  pending = { kind: "selection", context, span };
+  const marked = rangeFromOffsets(map, span.start, span.end);
+  markActive(null);
+  setHighlight(PENDING_HIGHLIGHT, marked);
+  bubbleEl = null;
+  bubbleRange = marked;
+  showBubble();
 
+  // A long passage quotes its opening and closing words, joined by […].
+  const said = sel.toString().trim() || context.quote;
+  const quote = said.length > LONG_SELECTION ? `${said.slice(0, LONG_PART).trimEnd()} […] ${said.slice(-LONG_PART).trimStart()}` : said;
   post("eh:compose", {
     kind: "selection",
     quote,
-    anchor: { ...context, selector: cssPath(range.commonAncestorContainer.parentElement || document.body) },
+    anchor: { ...buildAnchor(text, span.start, span.end), selector: cssPath(common.nodeType === 1 ? common : common.parentElement || document.body) },
   });
   return true;
 }
 
-function openElementCompose(container) {
-  if (pending && pending.element === container.el) return;
+/** Comment on a heading's whole section: it, and everything under it. */
+function openSectionCompose(heading, { focus = false } = {}) {
+  if (pending && pending.kind === "section" && pending.heading === heading) {
+    if (focus) post("eh:composeFocus", {});
+    return;
+  }
+  clearPending();
+  pending = { kind: "section", heading };
+  setHighlight(SECTION_HIGHLIGHT, sectionRange(heading));
+  bubbleEl = heading;
+  showBubble();
+  const title = clip(heading.textContent, 200);
+  post("eh:compose", {
+    kind: "section",
+    quote: title,
+    anchor: { heading: title, level: headingLevel(heading), selector: cssPath(heading) },
+    focus,
+  });
+}
+
+function openElementCompose(container, { focus = false } = {}) {
+  if (pending && pending.element === container.el) {
+    if (focus) post("eh:composeFocus", {});
+    return;
+  }
+  if (pending && pending.kind === "section") clearHighlight(SECTION_HIGHLIGHT);
   pending = { kind: "element", element: container.el };
-  place(els.activeBox, container.el);
+  setHighlight(PENDING_HIGHLIGHT, null);
+  markActive(container.el);
+  bubbleRange = null;
+  bubbleEl = container.el;
+  showBubble();
   post("eh:compose", {
     kind: "element",
     quote: container.label,
     anchor: { selector: cssPath(container.el), label: container.label },
+    focus,
   });
+}
+
+const BLOCK_WITHOUT_TEXT = "img, svg, canvas, video, picture, iframe, figure, .diagram";
+
+/**
+ * A comment on a whole block takes a deliberate gesture: Alt-click, or the
+ * block's comment chip. A plain click only does so where there is no text to
+ * select (an image, a diagram) or on an authored data-container. Anywhere
+ * else a click places the caret, and must not pull focus into the comment
+ * field while the user is trying to edit.
+ */
+function blockCommentTarget(node, deliberate) {
+  const el = node && node.nodeType === 1 ? node : node && node.parentElement;
+  if (!el || !el.closest || isOurs(el)) return null;
+  if (deliberate || el.closest("[data-container]")) return targetFor(el);
+  const media = el.closest(BLOCK_WITHOUT_TEXT);
+  return media ? targetFor(media) : null;
 }
 
 /** Commit turns the remembered range into real <mark> wrappers. */
 function commitPending(id) {
   if (!pending) return;
-  if (pending.kind === "element") {
+  if (pending.kind === "section") {
+    if (pending.heading.isConnected) {
+      wrapElementText(pending.heading, id);
+      sectionHeadings.set(id, pending.heading);
+    }
+  } else if (pending.kind === "element") {
     if (pending.element && pending.element.isConnected) pending.element.setAttribute("data-eh-el", id);
   } else {
     const { text, map } = flatten();
-    const hit = findQuote(text, pending.context);
+    // The settled span is exact while the text around it is unchanged; only
+    // edits made since the selection need the quote to be searched again.
+    const { span, context } = pending;
+    const hit = span && text.slice(span.start, span.end) === context.quote ? span : findQuote(text, context);
     if (hit) wrapOffsets(map, hit.start, hit.end, id);
   }
   const sel = document.getSelection();
@@ -779,8 +963,19 @@ function reanchor(comments) {
   const resolved = [];
   const orphaned = [];
   for (const comment of comments) {
-    if (marksFor(comment.id).length) {
+    const existing = marksFor(comment.id);
+    if (existing.length) {
+      if (comment.kind === "section") sectionHeadings.set(comment.id, existing[0].closest(HEADINGS));
       resolved.push(comment.id);
+      continue;
+    }
+    if (comment.kind === "section") {
+      const heading = findHeading(comment.anchor);
+      if (heading) {
+        wrapElementText(heading, comment.id);
+        sectionHeadings.set(comment.id, heading);
+      }
+      (heading ? resolved : orphaned).push(comment.id);
       continue;
     }
     if (comment.kind === "element") {
@@ -791,7 +986,7 @@ function reanchor(comments) {
       continue;
     }
     const { text, map } = flatten();
-    const hit = comment.anchor ? findQuote(text, comment.anchor) : null;
+    const hit = comment.anchor ? findSpan(text, comment.anchor) : null;
     if (!hit) {
       orphaned.push(comment.id);
       continue;
@@ -800,6 +995,25 @@ function reanchor(comments) {
     (marks.length ? resolved : orphaned).push(comment.id);
   }
   post("eh:anchorStatus", { resolved, orphaned });
+}
+
+/** Open the collapsed tab or accordion a target sits in, when a control names it. */
+function revealHidden(target) {
+  let hidden = target.closest("[hidden]") || null;
+  if (!hidden) {
+    let probe = target.parentElement;
+    while (probe && probe !== document.body) {
+      if (getComputedStyle(probe).display === "none") {
+        hidden = probe;
+        break;
+      }
+      probe = probe.parentElement;
+    }
+  }
+  if (hidden) {
+    const control = hidden.id ? document.querySelector(`[aria-controls="${CSS.escape(hidden.id)}"]`) : null;
+    if (control) control.click();
+  }
 }
 
 function activate(id, scroll) {
@@ -811,24 +1025,12 @@ function activate(id, scroll) {
   }
   for (const mark of document.querySelectorAll(`mark[${MARK_ATTR}]`)) mark.classList.remove("eh-active");
   for (const mark of marks) mark.classList.add("eh-active");
-  place(els.activeBox, target);
+  markActive(target);
+  const heading = sectionHeadings.get(id);
+  if (heading && heading.isConnected) setHighlight(SECTION_HIGHLIGHT, sectionRange(heading));
+  else if (!(pending && pending.kind === "section")) clearHighlight(SECTION_HIGHLIGHT);
   if (target && scroll) {
-    // Reveal a target hidden inside a collapsed tab or accordion.
-    let hidden = target.closest("[hidden]") || null;
-    if (!hidden) {
-      let probe = target.parentElement;
-      while (probe && probe !== document.body) {
-        if (getComputedStyle(probe).display === "none") {
-          hidden = probe;
-          break;
-        }
-        probe = probe.parentElement;
-      }
-    }
-    if (hidden) {
-      const control = hidden.id ? document.querySelector(`[aria-controls="${CSS.escape(hidden.id)}"]`) : null;
-      if (control) control.click();
-    }
+    revealHidden(target);
     const rect = target.getBoundingClientRect();
     if (!rect.width && !rect.height) {
       post("eh:notInView", { id });
@@ -838,6 +1040,112 @@ function activate(id, scroll) {
     // app's inner scroll container are reached too, not just window-scrolled ones.
     target.scrollIntoView({ block: "center", behavior: "smooth" });
   }
+}
+
+// ----------------------------------------------------------------- outline
+
+/**
+ * The page's headings, for the contents panel. The chrome only ever sees
+ * levels and text; clicks come back as an index into this list, which is
+ * rebuilt whenever the headings themselves change.
+ */
+const OUTLINE_LIMIT = 400;
+let outline = [];
+let outlineSignature = null;
+let outlineActive = -1;
+let outlineTimer = null;
+let spyLockUntil = 0;
+let flashTimer = null;
+const WORDS_PER_MINUTE = 230;
+
+function collectOutline() {
+  const headings = [...document.body.querySelectorAll("h1, h2, h3, h4, h5, h6")]
+    .filter((el) => !isOurs(el) && el.textContent.trim())
+    .slice(0, OUTLINE_LIMIT);
+  const items = headings.map((el) => ({ level: Number(el.tagName[1]), text: clip(el.textContent, 120) }));
+  const signature = items.map((item) => `${item.level}:${item.text}`).join("\n");
+  outline = headings;
+  if (signature === outlineSignature) return;
+  const first = outlineSignature === null;
+  outlineSignature = signature;
+  outlineActive = -1;
+  // Reading time comes from the boot text; recounting on every keystroke
+  // in a long document would cost more than the estimate is worth.
+  const minutes = first ? Math.max(1, Math.round((flatten().text.match(/\S+/g) || []).length / WORDS_PER_MINUTE)) : undefined;
+  post("eh:outline", { items, ...(minutes ? { minutes } : {}) });
+  updateOutlineActive();
+}
+
+function scheduleOutline() {
+  cancelLater(outlineTimer);
+  outlineTimer = later(collectOutline, 400);
+}
+
+/** The heading being read: the last one that has scrolled past the toolbar. */
+function updateOutlineActive() {
+  if (!outline.length || Date.now() < spyLockUntil) return;
+  const atBottom = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2;
+  let index = -1;
+  for (let i = 0; i < outline.length; i += 1) {
+    const r = outline[i].getBoundingClientRect();
+    if (!r.width && !r.height) continue;
+    if (r.top <= TOOLBAR_GUARD + 40 || (atBottom && r.top < window.innerHeight)) index = i;
+  }
+  setOutlineActive(index);
+}
+
+function setOutlineActive(index) {
+  if (index === outlineActive) return;
+  outlineActive = index;
+  post("eh:outlineActive", { index });
+}
+
+const reducedMotion = () => !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+
+function goToHeading(index) {
+  const el = outline[index];
+  if (!el || !el.isConnected) return;
+  revealHidden(el);
+  const rect = el.getBoundingClientRect();
+  if (!rect.width && !rect.height) {
+    post("eh:headingHidden", {});
+    return;
+  }
+  // A smooth scroll passes every heading on the way; report the destination.
+  spyLockUntil = Date.now() + 900;
+  setOutlineActive(index);
+  el.scrollIntoView?.({ block: "start", behavior: reducedMotion() ? "auto" : "smooth" });
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  setHighlight(FLASH_HIGHLIGHT, range);
+  cancelLater(flashTimer);
+  flashTimer = later(() => clearHighlight(FLASH_HIGHLIGHT), 1600);
+}
+
+// ----------------------------------------------------------------- reading
+
+/**
+ * Reading settings apply to pages whose styling is ours — rendered Markdown,
+ * which declares every variant itself. An HTML artifact styles itself and is
+ * left exactly as authored.
+ */
+const readerPage = () => !!document.querySelector('meta[name="human-review-reader"]');
+
+function applyReader(settings) {
+  if (!readerPage()) return;
+  for (const [name, value] of Object.entries(readerSettings(settings))) {
+    document.documentElement.setAttribute(`data-eh-${name}`, value);
+  }
+  host.toggleAttribute("data-eh-dark", document.documentElement.getAttribute("data-eh-theme") === "dark");
+}
+
+function postScroll() {
+  const max = document.documentElement.scrollHeight - window.innerHeight;
+  post("eh:scroll", {
+    x: window.scrollX,
+    y: window.scrollY,
+    progress: max > 4 ? Math.min(1, Math.max(0, window.scrollY / max)) : null,
+  });
 }
 
 // -------------------------------------------------------------------- boot
@@ -853,6 +1161,10 @@ function boot() {
     mark[${MARK_ATTR}].eh-active { background: rgba(255,180,0,.55); }
     body[contenteditable]:focus { outline: none; }
     ::selection { background: rgba(245,196,0,.42); }
+    ::highlight(eh-pending) { background-color: rgba(245,196,0,.34); text-decoration: underline 2px rgba(201,149,0,.85); }
+    ::highlight(eh-section) { background-color: rgba(245,196,0,.16); }
+    ::highlight(eh-flash) { background-color: rgba(245,196,0,.38); }
+    :where(h1, h2, h3, h4, h5, h6) { scroll-margin-top: ${TOOLBAR_GUARD + 8}px; }
   `;
   document.head.appendChild(style);
 
@@ -875,17 +1187,58 @@ function boot() {
     },
   });
 
+  // A new press starts a new interaction; the old bubble would point at nothing.
+  listen(document, "mousedown", (event) => {
+    if (!isOurs(event.target)) hideBubble();
+  }, true);
+
   listen(document, "mouseup", (event) => {
     if (isOurs(event.target) || resizing || Date.now() < suppressUntil) return;
+    const { target, altKey } = event;
     later(() => {
       if (settleSelection()) return;
-      const target = targetFor(event.target);
-      if (target) {
-        openElementCompose(target);
+      // Alt-click on a heading takes its whole section; anywhere else, the block.
+      const el = target && target.nodeType === 1 ? target : target && target.parentElement;
+      const heading = altKey && el ? el.closest(HEADINGS) : null;
+      if (heading && !isOurs(heading)) {
+        openSectionCompose(heading, { focus: true });
+        return;
+      }
+      const block = blockCommentTarget(target, altKey);
+      if (block) {
+        openElementCompose(block, { focus: altKey });
         return;
       }
       post("eh:dismiss", {});
     }, 0);
+  });
+
+  listen(els.chipComment, "click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (isHeading(hoverTarget)) {
+      openSectionCompose(hoverTarget, { focus: true });
+      return;
+    }
+    const target = hoverTarget ? targetFor(hoverTarget) : null;
+    if (target) openElementCompose(target, { focus: true });
+  });
+
+  // Pressing a bubble button must not take the selection or focus with it.
+  listen(els.bubble, "mousedown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  listen(els.bubble, "click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const button = event.target.closest ? event.target.closest("button") : null;
+    if (!button) return;
+    if (button === els.bubbleComment) post("eh:composeFocus", {});
+    else if (button.dataset.preset) {
+      els.bubble.style.display = "none";
+      post("eh:preset", { id: button.dataset.preset });
+    }
   });
 
   // A selection made with the keyboard (Shift+arrows, Shift+Home/End) never
@@ -895,7 +1248,7 @@ function boot() {
   listen(document,
     "keyup",
     (event) => {
-      if (isOurs(event.target) || resizing || moving || linkState) return;
+      if (isOurs(event.target) || resizing || linkState) return;
       const extending = event.shiftKey && /^(Arrow(Left|Right|Up|Down)|Home|End|PageUp|PageDown)$/.test(event.key);
       const selectAll = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a";
       if (event.key !== "Shift" && !extending && !selectAll) return;
@@ -959,19 +1312,13 @@ function boot() {
   }, true);
 
   listen(document, "mouseover", (event) => {
-    if (isOurs(event.target) || resizing || moving) return;
+    if (isOurs(event.target) || resizing) return;
     const target = targetFor(event.target);
     hoverTarget = target ? target.el : null;
-    // The move handle works per element, not per labeled container, so each
-    // paragraph inside a card can travel on its own.
-    hoverMove = hoverTarget ? innermostBlock(event.target) || hoverTarget : null;
     hoverMedia = event.target.closest ? event.target.closest("img, video") : null;
     place(els.outline, hoverTarget);
     if (controlsAreSuppressed()) hideActionControls();
-    else {
-      showChip(hoverTarget);
-      showMover(hoverMove);
-    }
+    else showChip(hoverTarget);
     showGrip(hoverMedia);
     const interactive = event.target.closest && event.target.closest("a[href], [data-href], button, [role='button']") && (navigationHref(event.target) || !inPageControl(event.target));
     const draggable = hoverMedia && hoverMedia.tagName === "IMG";
@@ -979,13 +1326,11 @@ function boot() {
   });
 
   listen(document, "mouseleave", () => {
-    if (resizing || moving) return;
+    if (resizing) return;
     hoverTarget = null;
-    hoverMove = null;
     hoverMedia = null;
     place(els.outline, null);
     showChip(null);
-    showMover(null);
     showGrip(null);
     showHint("");
   });
@@ -1039,13 +1384,9 @@ function boot() {
   });
 
   /**
-   * Delete and move are the two gestures with no native undo, so the last
-   * one is kept restorable: the element itself, detached, plus where it was.
-   */
-  /**
-   * Every delete and move stays restorable for the life of the page: the
-   * element itself, detached or relocated, plus where it came from. The
-   * chrome's per-row Undo and ⌘Z both come here.
+   * A block delete has no native undo, so every one stays restorable for the
+   * life of the page: the element itself, detached, plus where it came from.
+   * The chrome's per-row Undo and ⌘Z both come here.
    */
   const undoStack = []; // [{ kind, el, parent, next, label, at }]
   disposers.push(() => { undoStack.length = 0; });
@@ -1203,13 +1544,11 @@ function boot() {
 
   const hideActionControls = () => {
     showChip(null);
-    showMover(null);
   };
 
   const restoreActionControls = () => {
     if (controlsAreSuppressed()) return;
     showChip(hoverTarget);
-    showMover(hoverMove);
   };
 
   const suppressActionControlsWhileTyping = () => {
@@ -1499,6 +1838,16 @@ function boot() {
         post("eh:sendRequest", {});
         return;
       }
+      // Focus usually sits in this frame while reading; Esc still has to
+      // reach the chrome to dismiss a comment or leave focus mode.
+      if (event.key === "Escape") {
+        if (linkState) closeLinkbox(true);
+        else {
+          hideBubble();
+          post("eh:escape", {});
+        }
+        return;
+      }
       if (!editMode) return;
       const sel = document.getSelection();
       const anchor = sel ? sel.anchorNode : null;
@@ -1521,11 +1870,6 @@ function boot() {
           event.preventDefault();
           event.stopPropagation();
         }
-        return;
-      }
-
-      if (event.key === "Escape" && linkState) {
-        closeLinkbox(true);
         return;
       }
 
@@ -1687,122 +2031,6 @@ function boot() {
     }
   });
 
-  // ------------------------------------------------------------- block moves
-
-  // The handle on a block's left edge moves the whole block. Pointer-based,
-  // not HTML5 drag: the element is relocated on drop, never cloned, so
-  // identity (labels, captured originals, comment anchors) survives the move.
-  let moving = null; // { el, label, drop: { ref, before } | null } while the handle is held
-
-  /** Within this many pixels of a container's outer edge, the drop targets the container. */
-  const CONTAINER_EDGE = 10;
-
-  const dropPointFor = (x, y) => {
-    const under = document.elementFromPoint(x, y);
-    if (!under || isOurs(under)) return null;
-    const block = innermostBlock(under);
-    if (!block || block === moving.el || moving.el.contains(block)) return null;
-    // Near the top or bottom edge of a card or section, the whole container
-    // is the target, so a block can be dropped past it rather than only
-    // beside one of its children. The outermost qualifying ancestor wins.
-    let chosen = block;
-    let ancestor = block.parentElement;
-    while (ancestor && ancestor !== document.body && !isOurs(ancestor)) {
-      if (ancestor !== moving.el && !moving.el.contains(ancestor) && isBlock(ancestor)) {
-        const box = ancestor.getBoundingClientRect();
-        if (y - box.top <= CONTAINER_EDGE || box.bottom - y <= CONTAINER_EDGE) chosen = ancestor;
-      }
-      ancestor = ancestor.parentElement;
-    }
-    const r = chosen.getBoundingClientRect();
-    return { ref: chosen, before: y < r.top + r.height / 2 };
-  };
-
-  listen(els.mover, "pointerdown", (event) => {
-    const el = hoverMove && hoverMove.isConnected ? hoverMove : hoverTarget;
-    if (!el || !el.isConnected) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const target = targetFor(el);
-    moving = { el, label: target ? target.label : "Block", drop: null, pointer: { x: event.clientX, y: event.clientY } };
-    captureOriginal(moving.el);
-    // Dimming the block is our doing, not the page rendering itself: say so
-    // before touching it, or a move as the first action reads as self-render
-    // and switches saves off for the rest of the review.
-    userEdited = true;
-    moving.el.style.opacity = "0.4";
-    place(els.outline, null);
-    showChip(null);
-    nextFrame(autoScroll);
-    try {
-      els.mover.setPointerCapture(event.pointerId);
-    } catch {
-      // Window-level listeners track the move even without capture.
-    }
-  });
-
-  /**
-   * Near the top or bottom edge the page scrolls on its own, so a block can
-   * travel further than one screen. Runs per frame while the handle is held.
-   */
-  const EDGE = 56;
-  const autoScroll = () => {
-    if (!moving) return;
-    const { x, y } = moving.pointer;
-    let step = 0;
-    if (y < EDGE) step = -Math.ceil((EDGE - y) / 4);
-    else if (y > window.innerHeight - EDGE) step = Math.ceil((y - (window.innerHeight - EDGE)) / 4);
-    if (step) {
-      window.scrollBy(0, step);
-      const next = dropPointFor(x, y);
-      if (next) moving.drop = next;
-      showDropline(moving.drop, moving.pointer, moving.label);
-    }
-    nextFrame(autoScroll);
-  };
-
-  listen(window, "pointermove", (event) => {
-    if (!moving) return;
-    event.preventDefault();
-    moving.pointer = { x: event.clientX, y: event.clientY };
-    // Over a margin or gutter there is no block under the pointer; keep the
-    // last real target rather than blinking the indicator off and on.
-    const next = dropPointFor(event.clientX, event.clientY);
-    if (next) moving.drop = next;
-    showDropline(moving.drop, moving.pointer, moving.label);
-  });
-
-  listen(window, "pointerup", () => {
-    if (!moving) return;
-    const { el, label, drop } = moving;
-    moving = null;
-    showDropline(null);
-    showMover(null);
-    el.style.opacity = "";
-    suppressUntil = Date.now() + 250;
-    if (!drop || !drop.ref.isConnected || !el.isConnected) return;
-    // Dropping right back where it came from is a no-op, not an edit.
-    const next = drop.before ? drop.ref : drop.ref.nextElementSibling;
-    if (next === el || (drop.before ? drop.ref.previousElementSibling : drop.ref) === el) return;
-    userEdited = true;
-    remember({ kind: "moved", el, parent: el.parentNode, prev: el.previousSibling, next: el.nextSibling, label });
-    drop.ref.parentNode.insertBefore(el, next);
-    const prev = el.previousElementSibling;
-    const following = el.nextElementSibling;
-    queueEdit({
-      label,
-      kind: "moved",
-      before: originalText.get(el),
-      after: el.textContent,
-      before_html: originalHtml.get(el),
-      after_html: blockHtml(el),
-      moved_after: prev ? clip(prev.textContent, 90) : "",
-      moved_before: following ? clip(following.textContent, 90) : "",
-    });
-    flushSave();
-    post("eh:undoable", { label, kind: "moved" });
-  });
-
   // ------------------------------------------------------------- image paste
 
   // Pasted images cross to the chrome page as bytes; the server writes them
@@ -1915,8 +2143,9 @@ function boot() {
 
   const reposition = () => {
     place(els.outline, hoverTarget);
+    place(els.activeBox, activeBoxEl);
+    showBubble();
     showChip(hoverTarget);
-    showMover(moving ? null : hoverMove);
     showGrip(resizing ? resizing.el : hoverMedia);
     // The popup is viewport-fixed; scrolled away from its text it just lies.
     if (linkState) closeLinkbox(false);
@@ -1943,11 +2172,16 @@ function boot() {
       scrollQueued = true;
       nextFrame(() => {
         scrollQueued = false;
-        post("eh:scroll", { x: window.scrollX, y: window.scrollY });
+        postScroll();
+        updateOutlineActive();
       });
     },
     { passive: true }
   );
+  listen(window, "scrollend", () => {
+    spyLockUntil = 0;
+    updateOutlineActive();
+  });
 
   listen(window, "message", (event) => {
     // Only the chrome page may drive the SDK — not popups the artifact opened,
@@ -2029,9 +2263,10 @@ function boot() {
         composeOpen = true;
         break;
       case "eh:remove":
+        if (sectionHeadings.delete(msg.id)) clearHighlight(SECTION_HIGHLIGHT);
         unwrap(msg.id);
         document.querySelectorAll(`[data-eh-el="${CSS.escape(msg.id)}"]`).forEach((el) => el.removeAttribute("data-eh-el"));
-        place(els.activeBox, null);
+        markActive(null);
         break;
       case "eh:activate":
         activate(msg.id, !!msg.scroll);
@@ -2070,12 +2305,47 @@ function boot() {
       case "eh:undo":
         restoreBlock(String(msg.label || ""), String(msg.kind || ""));
         break;
+      case "eh:presets":
+        presets = (Array.isArray(msg.presets) ? msg.presets : []).slice(0, 12).map((preset) => ({
+          id: String(preset.id || ""),
+          label: clip(preset.label, 32),
+          text: String(preset.text || ""),
+          bubble: !!preset.bubble,
+        })).filter((preset) => preset.id && preset.label);
+        renderPresets();
+        showBubble();
+        break;
+      case "eh:outlineGo":
+        goToHeading(Number(msg.index));
+        break;
+      case "eh:sectionComment": {
+        const heading = outline[Number(msg.index)];
+        if (!heading || !heading.isConnected) break;
+        goToHeading(Number(msg.index));
+        openSectionCompose(heading, { focus: true });
+        break;
+      }
+      case "eh:reader":
+        applyReader(msg.settings);
+        // The layout just moved under every overlay and heading.
+        scheduleReposition();
+        postScroll();
+        updateOutlineActive();
+        break;
       default:
         break;
     }
   });
 
-  post("eh:ready", { scrollHeight: document.body.scrollHeight });
+  // The server may already have rendered the page dark.
+  applyReader({});
+  post("eh:ready", { scrollHeight: document.body.scrollHeight, reader: readerPage() });
+
+  // Headings change as the user types and as the agent's rewrite lands.
+  outlineObserver = new MutationObserver(scheduleOutline);
+  outlineObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+  collectOutline();
+  postScroll();
 }
 
 if (document.readyState === "loading") listen(document, "DOMContentLoaded", boot);

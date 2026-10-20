@@ -105,6 +105,52 @@ export function findQuote(text, ctx) {
   return { start: map[at], end: map[at + flatQuote.length - 1] + 1, exact: false };
 }
 
+/** Selections longer than this travel as their first and last parts. */
+export const LONG_SELECTION = 3600;
+export const LONG_PART = 1600;
+
+/**
+ * The anchor for a selection. A long one keeps its opening words in `quote`
+ * and its closing words in `end`, so a passage of any length fits the
+ * comment limits and can still be found again, from first part to last.
+ */
+export function buildAnchor(text, start, end) {
+  const context = buildContext(text, start, end);
+  if (end - start <= LONG_SELECTION) return context;
+  return {
+    prefix: context.prefix,
+    quote: text.slice(start, start + LONG_PART),
+    suffix: "",
+    end: text.slice(end - LONG_PART, end),
+    end_suffix: context.suffix,
+    long: true,
+  };
+}
+
+/** Locate an anchor from buildAnchor: a plain quote, or a long one by both ends. */
+export function findSpan(text, anchor) {
+  if (!anchor || !anchor.long) return findQuote(text, anchor);
+  const head = findQuote(text, { prefix: anchor.prefix, quote: anchor.quote, suffix: "" });
+  if (!head) return null;
+  const rest = text.slice(head.end);
+  const tail = findQuote(rest, { prefix: "", quote: anchor.end, suffix: anchor.end_suffix || "" });
+  if (!tail) return null;
+  return { start: head.start, end: head.end + tail.end, exact: head.exact && tail.exact };
+}
+
+/**
+ * Shrink a span so it starts and ends on visible text. A triple-click or a
+ * drag past the line end takes the trailing newline and indentation along;
+ * the comment should mark the words, not the gap after them.
+ */
+export function trimSpan(text, start, end) {
+  let from = Math.max(0, start);
+  let to = Math.min(text.length, end);
+  while (from < to && /\s/.test(text[from])) from += 1;
+  while (to > from && /\s/.test(text[to - 1])) to -= 1;
+  return to > from ? { start: from, end: to } : null;
+}
+
 /** Collapse runs of whitespace for display in a comment card. */
 export function tidy(text, limit = 0) {
   const flat = String(text == null ? "" : text)

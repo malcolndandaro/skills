@@ -824,6 +824,7 @@ export function createServer() {
     "/editing.js": ["editing.js", CORS],
     "/anchor-text.js": ["anchor-text.js", CORS],
     "/frame-policy.js": ["frame-policy.js", CORS],
+    "/reader.js": ["reader.js", CORS],
     "/click-target.js": ["click-target.js", CORS],
     "/serialize.js": ["serialize.js", CORS],
   };
@@ -1014,7 +1015,7 @@ export function createServer() {
               return res.end("File is gone");
             }
             // Markdown reviews render on the fly; the source file stays untouched.
-            if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file);
+            if (isMarkdown(page.file)) html = renderMarkdownPage(html, page.file, url.searchParams);
           }
           const headers = { "content-type": MIME[".html"], "cache-control": "no-store" };
           if (page.kind === "url") {
@@ -1117,7 +1118,7 @@ export function createServer() {
         if (feedback.length > MAX_COMMENT_FEEDBACK || quote.length > MAX_COMMENT_QUOTE) {
           return json(res, 400, { error: `feedback is limited to ${MAX_COMMENT_FEEDBACK} and quote to ${MAX_COMMENT_QUOTE} characters` });
         }
-        if (anchor && (typeof anchor !== "object" || [anchor.prefix, anchor.quote, anchor.suffix].some((part) => typeof part === "string" && part.length > MAX_COMMENT_ANCHOR_FIELD))) {
+        if (anchor && (typeof anchor !== "object" || [anchor.prefix, anchor.quote, anchor.suffix, anchor.end, anchor.end_suffix, anchor.heading, anchor.selector].some((part) => typeof part === "string" && part.length > MAX_COMMENT_ANCHOR_FIELD))) {
           return json(res, 400, { error: `anchor fields are limited to ${MAX_COMMENT_ANCHOR_FIELD} characters` });
         }
         let screenshot = null;
@@ -1128,7 +1129,7 @@ export function createServer() {
         }
         const comment = {
           id: uid("c"),
-          kind: body.kind === "element" ? "element" : body.kind === "screenshot" ? "screenshot" : "selection",
+          kind: ["element", "section", "screenshot"].includes(body.kind) ? body.kind : "selection",
           quote,
           anchor,
           feedback,

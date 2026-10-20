@@ -67,7 +67,14 @@ again. New comments and edits made while the agent was working remain pending.
 
 - Edit and Read modes, formatting controls, lists, undo and redo.
 - Find in the rendered document, with next and previous matches.
-- Select text or click an element to comment; the comment field focuses immediately.
+- Select text to comment on exactly those words, from a bar beside the selection
+  that also files quick comments (Explain better, Be clearer, Rephrase, Fix
+  grammar, Human writing, Shorten, Ask Genie One). Alt-click or a block's comment button covers the whole block.
+- Comment on a whole section (a heading and everything under it) from the
+  heading's comment button, Alt-click on the heading, or its Contents entry.
+- A Contents panel built from the headings, following the reading position.
+- Reading settings for Markdown (width, text size, font, light/sepia/dark) and a
+  Focus mode that hides both panels.
 - Capture a selected area, the viewport or the full page.
 - Draw red pencil strokes or dots, undo or clear them, and include them in captures.
 - Upload a PNG or JPEG and attach it to a comment.

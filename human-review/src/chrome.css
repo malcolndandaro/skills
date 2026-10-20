@@ -25,6 +25,8 @@
   --btn-bg: #1b1a16;
   --btn-fg: #fbfaf7;
   --rail-w: 352px;
+  --toc-w: 264px;
+  --accent: #e0a800;
 }
 
 :root[data-theme="dark"] {
@@ -76,8 +78,9 @@ button, textarea { font: inherit; color: inherit; }
 
 .app { display: flex; height: 100vh; }
 
-/* The artifact takes all remaining width and styles itself. */
-.stage { position: relative; flex: 1; min-width: 0; background: var(--canvas); }
+/* The artifact takes all remaining width and styles itself. The toolbar
+   adapts to the stage's own width, which the side panels change. */
+.stage { position: relative; flex: 1; min-width: 0; background: var(--canvas); container-type: inline-size; }
 #frame { width: 100%; height: 100%; border: 0; display: block; background: #fff; }
 
 /* These controls belong to the review shell, not the artifact. They float in
@@ -624,6 +627,145 @@ body.collapsed .handle { right: 0; }
 .edit-row.sent { opacity: .55; }
 .edit-row.sent .pip { background: var(--green); }
 
-@media (max-width: 980px) {
-  .format-group .tool-btn:nth-child(n+5), #captureViewport, #captureFullpage, #uploadScreenshot { display: none; }
+@container (max-width: 1080px) {
+  #captureViewport, #captureFullpage, #uploadScreenshot { display: none; }
 }
+@container (max-width: 900px) {
+  .format-group .tool-btn:nth-child(n+5) { display: none; }
+}
+@container (max-width: 720px) {
+  .format-group, #pencilToggle, #drawingUndo, #drawingClear { display: none; }
+}
+
+/* Contents: the page's headings, on the side opposite the comments. */
+.toc {
+  flex: none;
+  width: var(--toc-w);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--hair);
+  background: var(--rail);
+}
+.toc-head { display: flex; align-items: center; gap: 7px; padding: 16px 12px 8px 16px; }
+.toc-head .icon-btn { margin-left: auto; }
+.toc-list { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 8px 18px; }
+.toc-item {
+  display: -webkit-box;
+  width: 100%;
+  margin: 1px 0;
+  padding: 5px 8px 5px calc(10px + var(--depth, 0) * 13px);
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--mute-2);
+  font-size: 12.5px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.toc-item.depth-0 { color: var(--txt); font-weight: 600; }
+.toc-item.depth-3, .toc-item.depth-4 { font-size: 12px; }
+.toc-item:hover, .toc-item:focus-visible { background: var(--soft); color: var(--strong-txt); outline: none; }
+.toc-item.active { background: var(--chip); color: var(--strong-txt); box-shadow: inset 2px 0 0 var(--accent); }
+.toc-row { position: relative; }
+.toc-row .toc-item { padding-right: 30px; }
+.toc-comment {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 24px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mute);
+  opacity: 0;
+  cursor: pointer;
+}
+.toc-comment svg { width: 13px; height: 13px; }
+.toc-row:hover .toc-comment, .toc-comment:focus-visible { opacity: 1; }
+.toc-comment:hover, .toc-comment:focus-visible { border-color: var(--strong-border); background: var(--card); color: var(--strong-txt); outline: none; }
+
+/* How far through the page the reader is. */
+.progress { position: absolute; top: 0; left: 0; right: 0; z-index: 29; height: 2px; pointer-events: none; }
+.progress span { display: block; width: 0; height: 100%; background: var(--accent); transition: width 90ms linear; }
+
+.reader-panel {
+  position: absolute;
+  top: 51px;
+  right: 14px;
+  z-index: 32;
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--strong-border);
+  border-radius: 8px;
+  background: var(--rail);
+  box-shadow: 0 8px 26px -13px rgba(0, 0, 0, .5);
+  font-size: 11px;
+}
+.reader-row { display: flex; align-items: center; gap: 10px; }
+.reader-label { width: 44px; color: var(--mute); font-weight: 600; }
+.segmented { display: flex; gap: 2px; padding: 2px; border: 1px solid var(--hair); border-radius: 7px; background: var(--soft); }
+.segmented button {
+  min-width: 34px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--mute-2);
+  font-size: 11px;
+  cursor: pointer;
+}
+.segmented button:hover { color: var(--strong-txt); }
+.segmented button.active { background: var(--card); color: var(--strong-txt); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+
+/* Focus mode: only the page. The toolbar returns on hover. */
+body.focus-mode .toc, body.focus-mode .rail, body.focus-mode .handle { display: none; }
+body.focus-mode .stage-toolbar { opacity: 0; transition: opacity 160ms ease; }
+body.focus-mode .stage-toolbar:hover, body.focus-mode .stage-toolbar:focus-within { opacity: 1; }
+.focus-exit {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--rail) 94%, transparent);
+  color: var(--mute-2);
+  font-size: 11.5px;
+  cursor: pointer;
+  box-shadow: 0 6px 18px -10px rgba(0, 0, 0, .5);
+}
+.focus-exit:hover { color: var(--strong-txt); border-color: var(--strong-border); }
+#focusCount:empty { display: none; }
+#focusCount { padding-right: 8px; border-right: 1px solid var(--hair); }
+
+/* Read mode has nothing to format. */
+body[data-mode="read"] .format-group { display: none; }
+
+/* Quick comments: one click files a ready-made instruction. */
+.presets { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.preset {
+  padding: 3px 9px;
+  border: 1px solid var(--hair);
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--mute-2);
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.preset:hover, .preset:focus-visible { border-color: var(--strong-border); background: var(--card); color: var(--strong-txt); outline: none; }

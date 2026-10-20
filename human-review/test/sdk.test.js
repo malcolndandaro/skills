@@ -434,3 +434,238 @@ test("a pasted image lands at the caret once the chrome confirms where it was sa
   assert.equal(row.before, "Before the image.");
   assert.match(row.after_html, /<img src="assets\/design-paste-1\.png"/);
 });
+
+/** Select a range, then release the mouse over `target` the way a drag would. */
+async function releaseSelection(window, target, setRange, init = {}) {
+  const range = window.document.createRange();
+  setRange(range);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  target.dispatchEvent(new window.MouseEvent("mouseup", { bubbles: true, ...init }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+test("a triple-click selection ending at the next paragraph comments on the text, not the block", { skip }, async () => {
+  const { window, document, posts } = await bootSdk("<h2>Scope</h2>\n<p>Only this sentence.</p>\n<p>Not this one.</p>");
+  const [first, second] = document.querySelectorAll("p");
+  await releaseSelection(window, first, (range) => {
+    range.setStart(first.firstChild, 0);
+    range.setEnd(second, 0);
+  });
+  const compose = posts.filter((m) => m.type === "eh:compose");
+  assert.equal(compose.length, 1);
+  assert.equal(compose[0].kind, "selection", "an element-boundary end is still a text selection");
+  assert.equal(compose[0].anchor.quote, "Only this sentence.", "the trailing newline is trimmed off");
+});
+
+test("a selection that starts on the block element itself still maps to its words", { skip }, async () => {
+  const { window, document, posts } = await bootSdk("<p>Alpha <strong>beta</strong> gamma.</p>");
+  const p = document.querySelector("p");
+  await releaseSelection(window, p, (range) => {
+    range.setStart(p, 0);
+    range.setEnd(p.querySelector("strong").firstChild, 4);
+  });
+  const compose = posts.find((m) => m.type === "eh:compose");
+  assert.equal(compose.kind, "selection");
+  assert.equal(compose.anchor.quote, "Alpha beta");
+});
+
+test("committing a selection wraps exactly the settled words", { skip }, async () => {
+  const { window, document, fromChrome } = await bootSdk("<p>Repeat word, then repeat word again.</p>");
+  const text = document.querySelector("p").firstChild;
+  await releaseSelection(window, text.parentElement, (range) => {
+    range.setStart(text, 18);
+    range.setEnd(text, 29);
+  });
+  fromChrome({ type: "eh:commit", id: "c_1" });
+  const marks = document.querySelectorAll('mark[data-eh-mark="c_1"]');
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0].textContent, "repeat word");
+  assert.equal(marks[0].previousSibling.textContent, "Repeat word, then ", "the second occurrence, where it was selected");
+});
+
+test("a plain click places the caret; only Alt-click or the chip comments on the whole block", { skip }, async () => {
+  const { window, document, posts, shadow } = await bootSdk("<h2>Plan</h2><p>Click here to type.</p><figure><img src=\"a.png\" alt=\"Chart\"></figure>");
+  const p = document.querySelector("p");
+  const caret = async (init) => {
+    await releaseSelection(window, p, (range) => {
+      range.setStart(p.firstChild, 5);
+      range.collapse(true);
+    }, init);
+  };
+
+  await caret();
+  assert.equal(posts.filter((m) => m.type === "eh:compose").length, 0, "a caret click opens no comment");
+  assert.ok(posts.some((m) => m.type === "eh:dismiss"));
+
+  await caret({ altKey: true });
+  const alt = posts.filter((m) => m.type === "eh:compose");
+  assert.equal(alt.length, 1);
+  assert.equal(alt[0].kind, "element");
+  assert.equal(alt[0].focus, true, "a deliberate block comment takes focus");
+
+  posts.length = 0;
+  document.querySelector("img").dispatchEvent(new window.MouseEvent("mouseup", { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const media = posts.find((m) => m.type === "eh:compose");
+  assert.equal(media && media.kind, "element", "an image has no text to select, so a click comments on it");
+  assert.equal(media.focus, false);
+
+  posts.length = 0;
+  fromChromeCancel(window);
+  p.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+  shadow.getElementById("chipComment").click();
+  const chip = posts.find((m) => m.type === "eh:compose");
+  assert.equal(chip && chip.kind, "element");
+  assert.equal(chip.quote, "Plan · p");
+  assert.equal(chip.focus, true);
+});
+
+function fromChromeCancel(window) {
+  window.dispatchEvent(new window.MessageEvent("message", { data: { type: "eh:cancel" }, origin: CHROME_ORIGIN, source: window }));
+}
+
+test("the comment chip stays in Read mode, the delete chip does not", { skip }, async () => {
+  const { window, document, shadow, fromChrome } = await bootSdk("<p>Readable paragraph.</p>");
+  fromChrome({ type: "eh:mode", mode: "read" });
+  const p = document.querySelector("p");
+  p.getBoundingClientRect = () => ({ left: 0, top: 40, right: 300, bottom: 60, width: 300, height: 20, x: 0, y: 40 });
+  p.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+  assert.equal(shadow.getElementById("chips").style.display, "flex");
+  assert.equal(shadow.getElementById("chipDelete").style.display, "none");
+});
+
+test("quick comments from the selection bar reach the chrome by id", { skip }, async () => {
+  const { window, document, posts, shadow, fromChrome } = await bootSdk("<p>Some dense paragraph.</p>");
+  fromChrome({
+    type: "eh:presets",
+    presets: [
+      { id: "clearer", label: "Be clearer", text: "Make this clearer.", bubble: true },
+      { id: "remove", label: "Remove", text: "Remove this part." },
+    ],
+  });
+  const buttons = [...shadow.querySelectorAll("#bubblePresets button")];
+  assert.deepEqual(buttons.map((b) => b.textContent), ["Be clearer"], "only bubble presets are in the bar");
+  const p = document.querySelector("p");
+  await releaseSelection(window, p, (range) => {
+    range.setStart(p.firstChild, 5);
+    range.setEnd(p.firstChild, 10);
+  });
+  buttons[0].click();
+  assert.deepEqual(posts.filter((m) => m.type === "eh:preset").map((m) => m.id), ["clearer"]);
+  shadow.getElementById("bubbleComment").click();
+  assert.ok(posts.some((m) => m.type === "eh:composeFocus"), "Comment asks the chrome to focus the field");
+});
+
+test("the outline lists headings, follows edits, and navigates by index", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk("<h1>Title</h1><p>Intro.</p><h2>Goals</h2><h3>Detail</h3><h2></h2>");
+  const first = posts.find((m) => m.type === "eh:outline");
+  assert.deepEqual(first.items, [
+    { level: 1, text: "Title" },
+    { level: 2, text: "Goals" },
+    { level: 3, text: "Detail" },
+  ], "empty headings are left out");
+  assert.equal(first.minutes, 1);
+
+  document.querySelectorAll("h2")[0].textContent = "Goals and limits";
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const updated = posts.filter((m) => m.type === "eh:outline");
+  assert.equal(updated.length, 2);
+  assert.equal(updated[1].items[1].text, "Goals and limits");
+
+  let scrolled = null;
+  window.HTMLElement.prototype.scrollIntoView = function () {
+    scrolled = this;
+  };
+  const rect = { left: 0, top: 10, right: 100, bottom: 30, width: 100, height: 20, x: 0, y: 10 };
+  document.querySelector("h3").getBoundingClientRect = () => rect;
+  fromChrome({ type: "eh:outlineGo", index: 2 });
+  assert.equal(scrolled, document.querySelector("h3"));
+  assert.equal(posts.filter((m) => m.type === "eh:outlineActive").at(-1).index, 2);
+});
+
+test("reading settings apply only to pages that declare them", { skip }, async () => {
+  const plain = await bootSdk("<p>Authored HTML.</p>");
+  plain.fromChrome({ type: "eh:reader", settings: { width: "narrow", theme: "dark" } });
+  assert.equal(plain.document.documentElement.hasAttribute("data-eh-width"), false);
+  assert.equal(plain.posts.find((m) => m.type === "eh:ready").reader, false);
+
+  const md = await bootSdk('<meta name="human-review-reader" content="markdown"><main><p>Rendered.</p></main>');
+  assert.equal(md.posts.find((m) => m.type === "eh:ready").reader, true);
+  md.fromChrome({ type: "eh:reader", settings: { width: "full", size: "xl", font: "serif", theme: "sepia" } });
+  const root = md.document.documentElement;
+  assert.deepEqual(
+    ["width", "size", "font", "theme"].map((name) => root.getAttribute(`data-eh-${name}`)),
+    ["full", "xl", "serif", "sepia"]
+  );
+  md.fromChrome({ type: "eh:reader", settings: { width: "url(javascript:1)" } });
+  assert.equal(root.getAttribute("data-eh-width"), "full", "unknown values are ignored");
+  assert.equal(serializeDocument(md.document).includes("data-eh-width"), true, "markdown pages are never saved, so the attribute is harmless");
+});
+
+test("Esc inside the page is forwarded to the chrome", { skip }, async () => {
+  const { window, document, posts } = await bootSdk("<p>Text.</p>");
+  document.querySelector("p").dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  assert.ok(posts.some((m) => m.type === "eh:escape"));
+});
+
+test("a section comment covers its heading through the next heading of the same level", { skip }, async () => {
+  const { window, document, posts, shadow, fromChrome } = await bootSdk(
+    "<h1>Plan</h1><p>Intro.</p><h2>Scope</h2><p>In scope.</p><h3>Detail</h3><p>Deep.</p><h2>Risks</h2><p>Later.</p>"
+  );
+  const scope = document.querySelectorAll("h2")[0];
+  scope.getBoundingClientRect = () => ({ left: 0, top: 80, right: 300, bottom: 100, width: 300, height: 20, x: 0, y: 80 });
+  scope.dispatchEvent(new window.MouseEvent("mouseover", { bubbles: true }));
+  assert.equal(shadow.getElementById("chipComment").title, "Comment on this whole section");
+  shadow.getElementById("chipComment").click();
+  const compose = posts.find((m) => m.type === "eh:compose");
+  assert.equal(compose.kind, "section");
+  assert.equal(compose.quote, "Scope");
+  assert.deepEqual({ heading: compose.anchor.heading, level: compose.anchor.level }, { heading: "Scope", level: 2 });
+  assert.equal(compose.focus, true);
+
+  fromChrome({ type: "eh:commit", id: "c_section" });
+  assert.equal([...document.querySelectorAll('mark[data-eh-mark="c_section"]')].map((m) => m.textContent).join(""), "Scope", "the heading's words carry the mark");
+
+  // After a reload the comment finds its heading again by name and level.
+  fromChrome({ type: "eh:remove", id: "c_section" });
+  fromChrome({ type: "eh:anchors", comments: [{ id: "c_section", kind: "section", anchor: compose.anchor }] });
+  const status = posts.filter((m) => m.type === "eh:anchorStatus").at(-1);
+  assert.deepEqual(status.resolved, ["c_section"]);
+  assert.equal(document.querySelector('mark[data-eh-mark="c_section"]').closest("h2"), scope);
+});
+
+test("Alt-click on a heading and the Contents button open a section comment", { skip }, async () => {
+  const { window, document, posts, fromChrome } = await bootSdk("<h1>One</h1><p>A.</p><h1>Two</h1><p>B.</p>");
+  const two = document.querySelectorAll("h1")[1];
+  two.dispatchEvent(new window.MouseEvent("mouseup", { bubbles: true, altKey: true }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(posts.filter((m) => m.type === "eh:compose").map((m) => [m.kind, m.quote]), [["section", "Two"]]);
+
+  fromChrome({ type: "eh:cancel" });
+  window.HTMLElement.prototype.scrollIntoView = () => {};
+  document.querySelectorAll("h1")[0].getBoundingClientRect = () => ({ left: 0, top: 10, right: 100, bottom: 30, width: 100, height: 20, x: 0, y: 10 });
+  fromChrome({ type: "eh:sectionComment", index: 0 });
+  const last = posts.filter((m) => m.type === "eh:compose").at(-1);
+  assert.deepEqual([last.kind, last.quote, last.focus], ["section", "One", true]);
+});
+
+test("a selection longer than the quote limit keeps both ends and is found again", { skip }, async () => {
+  const words = (tag) => Array.from({ length: 700 }, (_, i) => `${tag}${i}`).join(" ");
+  const { window, document, posts, fromChrome } = await bootSdk(`<p>${words("a")}</p><p>${words("b")}</p>`);
+  const [first, second] = document.querySelectorAll("p");
+  await releaseSelection(window, first, (range) => {
+    range.setStart(first.firstChild, 0);
+    range.setEnd(second.firstChild, second.firstChild.length);
+  });
+  const compose = posts.find((m) => m.type === "eh:compose");
+  assert.equal(compose.kind, "selection");
+  assert.equal(compose.anchor.long, true);
+  assert.ok(compose.quote.length <= 4000 && compose.anchor.quote.length <= 4000 && compose.anchor.end.length <= 4000, "everything fits the comment limits");
+  assert.match(compose.quote, /^a0 a1 .* \[…\] .* b699$/s);
+
+  fromChrome({ type: "eh:anchors", comments: [{ id: "c_long", kind: "selection", anchor: compose.anchor }] });
+  const marked = [...document.querySelectorAll('mark[data-eh-mark="c_long"]')].map((m) => m.textContent).join("");
+  assert.equal(marked, first.textContent + second.textContent, "the whole passage is marked again from both ends");
+});
